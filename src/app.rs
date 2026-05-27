@@ -5,7 +5,11 @@ use crate::{
     initializr::{
         client::InitializrClient, generate::GenerationParams, metadata::InitializrMetadata,
     },
-    prompts::{dependencies, project::ProjectPlan},
+    prompts::{
+        dependencies,
+        project::ProjectPlan,
+        ui::{InquirePrompter, Prompter},
+    },
 };
 use anyhow::{Context, Result};
 use inquire::Confirm;
@@ -124,8 +128,17 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut stdout = stdout.lock();
     let mut stderr = stderr.lock();
     let mut confirmation = InquireConfirmation;
+    let mut prompter = InquirePrompter;
 
-    run_with_paths(cli, &paths, &mut stdout, &mut stderr, &mut confirmation).await
+    run_with_paths(
+        cli,
+        &paths,
+        &mut stdout,
+        &mut stderr,
+        &mut confirmation,
+        &mut prompter,
+    )
+    .await
 }
 
 pub async fn run_with_paths(
@@ -134,6 +147,7 @@ pub async fn run_with_paths(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
     confirmation: &mut impl Confirmation,
+    prompter: &mut impl Prompter,
 ) -> Result<()> {
     let mut metadata_client = InitializrClient::new_default()?;
     let mut starter_zip_client = metadata_client.clone();
@@ -145,18 +159,21 @@ pub async fn run_with_paths(
         stdout,
         stderr,
         confirmation,
+        prompter,
         &mut metadata_provider,
         &mut starter_zip_client,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with_services(
     cli: Cli,
     paths: &AppPaths,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
     confirmation: &mut impl Confirmation,
+    prompter: &mut impl Prompter,
     metadata_provider: &mut impl MetadataProvider,
     starter_zip_provider: &mut impl StarterZipProvider,
 ) -> Result<()> {
@@ -167,6 +184,7 @@ pub async fn run_with_services(
                 paths,
                 stdout,
                 confirmation,
+                prompter,
                 metadata_provider,
                 starter_zip_provider,
             )
@@ -191,11 +209,13 @@ pub async fn run_with_services(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_init(
     args: InitArgs,
     paths: &AppPaths,
     stdout: &mut impl Write,
     confirmation: &mut impl Confirmation,
+    prompter: &mut impl Prompter,
     metadata_provider: &mut impl MetadataProvider,
     starter_zip_provider: &mut impl StarterZipProvider,
 ) -> Result<()> {
@@ -205,7 +225,11 @@ async fn run_init(
 
     let config = user_config::load(&paths.user_config_file)?;
     let metadata = metadata_provider.fetch_metadata().await?;
-    let plan = ProjectPlan::from_defaults(&args, config.as_ref(), &metadata)?;
+    let plan = if args.defaults {
+        ProjectPlan::from_defaults(&args, config.as_ref(), &metadata)?
+    } else {
+        ProjectPlan::from_prompts(&args, config.as_ref(), &metadata, prompter)?
+    };
     plan.generation.validate(&metadata)?;
 
     prepare_output_dir(&plan.output_dir)?;
@@ -394,6 +418,56 @@ mod tests {
         }
     }
 
+    struct UnusedPrompter;
+
+    impl Prompter for UnusedPrompter {
+        fn text(&mut self, message: &str, _default: Option<&str>) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!(
+                "Prompter::text should not be called in this test (message: {message})"
+            ))
+        }
+
+        fn select(
+            &mut self,
+            message: &str,
+            _options: &[crate::initializr::metadata::SelectOption],
+            _default_id: Option<&str>,
+        ) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!(
+                "Prompter::select should not be called in this test (message: {message})"
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct ScriptedPrompter {
+        text_responses: std::collections::VecDeque<String>,
+        select_responses: std::collections::VecDeque<String>,
+        text_messages: Vec<String>,
+        select_messages: Vec<String>,
+    }
+
+    impl Prompter for ScriptedPrompter {
+        fn text(&mut self, message: &str, _default: Option<&str>) -> anyhow::Result<String> {
+            self.text_messages.push(message.to_string());
+            self.text_responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no scripted text response for {message:?}"))
+        }
+
+        fn select(
+            &mut self,
+            message: &str,
+            _options: &[crate::initializr::metadata::SelectOption],
+            _default_id: Option<&str>,
+        ) -> anyhow::Result<String> {
+            self.select_messages.push(message.to_string());
+            self.select_responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no scripted select response for {message:?}"))
+        }
+    }
+
     struct StaticMetadataProvider {
         metadata: InitializrMetadata,
     }
@@ -472,8 +546,17 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
 
-        run_with_paths(cli, &paths, &mut stdout, &mut stderr, &mut confirmation).await?;
+        run_with_paths(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut prompter,
+        )
+        .await?;
 
         let output = String::from_utf8(stdout)?;
         assert!(output.contains("group_id = \"com.example\""));
@@ -491,8 +574,17 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
 
-        run_with_paths(cli, &paths, &mut stdout, &mut stderr, &mut confirmation).await?;
+        run_with_paths(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut prompter,
+        )
+        .await?;
 
         let output = String::from_utf8(stdout)?;
         assert!(output.contains("No saved spg config found"));
@@ -517,8 +609,17 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::yes();
+        let mut prompter = UnusedPrompter;
 
-        run_with_paths(cli, &paths, &mut stdout, &mut stderr, &mut confirmation).await?;
+        run_with_paths(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut prompter,
+        )
+        .await?;
 
         assert!(!paths.user_config_file.exists());
         assert!(String::from_utf8(stdout)?.contains("Reset saved spg config"));
@@ -543,8 +644,17 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::no();
+        let mut prompter = UnusedPrompter;
 
-        run_with_paths(cli, &paths, &mut stdout, &mut stderr, &mut confirmation).await?;
+        run_with_paths(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut prompter,
+        )
+        .await?;
 
         assert!(paths.user_config_file.exists());
         assert!(String::from_utf8(stdout)?.contains("Kept saved spg config"));
@@ -564,8 +674,17 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
 
-        run_with_paths(cli, &paths, &mut stdout, &mut stderr, &mut confirmation).await?;
+        run_with_paths(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut prompter,
+        )
+        .await?;
 
         assert!(!paths.metadata_cache_file.exists());
         assert!(String::from_utf8(stdout)?.contains("Cleared Spring Initializr metadata cache"));
@@ -582,6 +701,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
         let mut metadata = StaticMetadataProvider {
             metadata: sample_metadata()?,
         };
@@ -593,6 +713,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             &mut confirmation,
+            &mut prompter,
             &mut metadata,
             &mut starter_zip,
         )
@@ -614,6 +735,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
         let mut metadata = StaticMetadataProvider {
             metadata: sample_metadata()?,
         };
@@ -625,6 +747,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             &mut confirmation,
+            &mut prompter,
             &mut metadata,
             &mut starter_zip,
         )
@@ -652,6 +775,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
         let mut upstream = CountingMetadataProvider {
             metadata: InitializrMetadata::default(),
             calls: 0,
@@ -670,6 +794,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             &mut confirmation,
+            &mut prompter,
             &mut cached,
             &mut starter_zip,
         )
@@ -691,6 +816,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
         let mut upstream = CountingMetadataProvider {
             metadata: sample_metadata()?,
             calls: 0,
@@ -710,6 +836,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             &mut confirmation,
+            &mut prompter,
             &mut cached,
             &mut starter_zip,
         )
@@ -754,6 +881,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
         let mut metadata = StaticMetadataProvider {
             metadata: full_sample_metadata()?,
         };
@@ -768,6 +896,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             &mut confirmation,
+            &mut prompter,
             &mut metadata,
             &mut starter_zip,
         )
@@ -813,6 +942,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
         let mut metadata = StaticMetadataProvider {
             metadata: full_sample_metadata()?,
         };
@@ -827,6 +957,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             &mut confirmation,
+            &mut prompter,
             &mut metadata,
             &mut starter_zip,
         )
@@ -861,6 +992,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::no();
+        let mut prompter = UnusedPrompter;
         let mut metadata = StaticMetadataProvider {
             metadata: full_sample_metadata()?,
         };
@@ -875,6 +1007,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             &mut confirmation,
+            &mut prompter,
             &mut metadata,
             &mut starter_zip,
         )
@@ -910,6 +1043,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
         let mut upstream = CountingMetadataProvider {
             metadata: full_sample_metadata()?,
             calls: 0,
@@ -931,6 +1065,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             &mut confirmation,
+            &mut prompter,
             &mut cached,
             &mut starter_zip,
         )
@@ -971,6 +1106,7 @@ mod tests {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
         let mut metadata = StaticMetadataProvider {
             metadata: full_sample_metadata()?,
         };
@@ -985,6 +1121,7 @@ mod tests {
             &mut stdout,
             &mut stderr,
             &mut confirmation,
+            &mut prompter,
             &mut metadata,
             &mut starter_zip,
         )
@@ -996,6 +1133,85 @@ mod tests {
         assert_eq!(params.java_version, "21");
         assert_eq!(params.dependencies, ["web"]);
         assert_eq!(params.package_name, "com.saved.saved_demo");
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_without_defaults_drives_interactive_prompts() -> anyhow::Result<()> {
+        let (paths, root) = temp_paths_with_root("init-interactive");
+        let output_dir = root.join("projects");
+
+        let cli = Cli::parse_from([
+            "spg",
+            "init",
+            "interactive-demo",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::default();
+        let mut prompter = ScriptedPrompter {
+            text_responses: [
+                "com.acme",
+                "interactive-demo",
+                "Interactive demo",
+                "com.acme.demo",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            select_responses: ["maven-project", "java", "3.5.0", "17", "jar"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ..ScriptedPrompter::default()
+        };
+        let mut metadata = StaticMetadataProvider {
+            metadata: full_sample_metadata()?,
+        };
+        let mut starter_zip = StaticStarterZipProvider {
+            bytes: make_demo_zip("interactive-demo")?,
+            captured: Vec::new(),
+        };
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut prompter,
+            &mut metadata,
+            &mut starter_zip,
+        )
+        .await?;
+
+        assert_eq!(
+            prompter.text_messages,
+            ["Group ID?", "Artifact ID?", "Description?", "Package name?",]
+        );
+        assert_eq!(
+            prompter.select_messages,
+            [
+                "Project type?",
+                "Language?",
+                "Spring Boot version?",
+                "Java version?",
+                "Packaging?",
+            ]
+        );
+        let params = &starter_zip.captured[0];
+        assert_eq!(params.group_id, "com.acme");
+        assert_eq!(params.artifact_id, "interactive-demo");
+        assert_eq!(params.description, "Interactive demo");
+        assert_eq!(params.package_name, "com.acme.demo");
+        assert_eq!(params.project_type, "maven-project");
+        assert_eq!(params.language, "java");
+        assert_eq!(params.java_version, "17");
+        assert_eq!(params.packaging, "jar");
 
         cleanup(&paths);
         Ok(())
