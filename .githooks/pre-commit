@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "error: cargo is required to run pre-commit tests" >&2
+  exit 1
+fi
+
+echo "Running pre-commit tests..."
+cargo test
