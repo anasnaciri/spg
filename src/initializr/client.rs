@@ -67,6 +67,26 @@ impl InitializrClient {
             .await
             .context("failed to parse Spring Initializr metadata")
     }
+
+    pub async fn download_starter_zip(&self, params: &GenerationParams) -> Result<Vec<u8>> {
+        let request = self.starter_zip_request(params)?;
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .context("failed to download Spring Initializr project archive")?;
+        let status = response.status();
+
+        if !status.is_success() {
+            bail!("Spring Initializr generation request failed with HTTP {status}");
+        }
+
+        response
+            .bytes()
+            .await
+            .map(|bytes| bytes.to_vec())
+            .context("failed to read Spring Initializr project archive")
+    }
 }
 
 #[cfg(test)]
@@ -111,6 +131,47 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn downloads_starter_zip_archive_bytes() -> anyhow::Result<()> {
+        let server =
+            TestServer::start("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nzip-bytes".to_string())?;
+        let client = InitializrClient::new(&server.base_url)?;
+
+        let bytes = client
+            .download_starter_zip(&sample_generation_params())
+            .await?;
+
+        assert_eq!(bytes, b"zip-bytes");
+        let request = server.request()?;
+        assert!(request.starts_with("GET /starter.zip?"));
+        assert!(request.contains("type=maven-project"));
+        assert!(request.contains("dependencies=web"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn starter_zip_download_reports_http_errors() -> anyhow::Result<()> {
+        let server = TestServer::start(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 6\r\n\r\nbroken".to_string(),
+        )?;
+        let client = InitializrClient::new(&server.base_url)?;
+
+        let error = client
+            .download_starter_zip(&sample_generation_params())
+            .await
+            .expect_err("HTTP error should fail generation download");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Spring Initializr generation request failed with HTTP 500")
+        );
+        assert!(server.request()?.starts_with("GET /starter.zip?"));
+
+        Ok(())
+    }
+
     fn sample_generation_params() -> GenerationParams {
         GenerationParams {
             project_type: "maven-project".to_string(),
@@ -125,6 +186,45 @@ mod tests {
             packaging: "jar".to_string(),
             java_version: "21".to_string(),
             dependencies: vec!["web".to_string()],
+        }
+    }
+
+    struct TestServer {
+        base_url: String,
+        request_rx: std::sync::mpsc::Receiver<String>,
+        thread: std::thread::JoinHandle<anyhow::Result<()>>,
+    }
+
+    impl TestServer {
+        fn start(response: String) -> anyhow::Result<Self> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let base_url = format!("http://{}", listener.local_addr()?);
+            let (request_tx, request_rx) = std::sync::mpsc::channel();
+
+            let thread = std::thread::spawn(move || -> anyhow::Result<()> {
+                use std::io::{Read, Write};
+
+                let (mut stream, _) = listener.accept()?;
+                let mut buffer = [0_u8; 4096];
+                let count = stream.read(&mut buffer)?;
+                request_tx.send(String::from_utf8_lossy(&buffer[..count]).into_owned())?;
+                stream.write_all(response.as_bytes())?;
+                Ok(())
+            });
+
+            Ok(Self {
+                base_url,
+                request_rx,
+                thread,
+            })
+        }
+
+        fn request(self) -> anyhow::Result<String> {
+            let request = self.request_rx.recv()?;
+            self.thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("test server thread panicked"))??;
+            Ok(request)
         }
     }
 }
