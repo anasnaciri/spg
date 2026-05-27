@@ -453,8 +453,7 @@ fn render_select_prompt(
     }
 
     lines.push(help_line("  Use arrows or j/k to move. Enter to select."));
-    render_lines(stdout, rendered_lines, &lines)?;
-    Ok(lines.len())
+    render_lines(stdout, rendered_lines, &lines)
 }
 
 fn select_visible_options(state: &SelectPromptState) -> Vec<String> {
@@ -527,8 +526,7 @@ fn render_multi_select_prompt(
     lines.push(help_line(
         "  Type to filter. Tab focuses list. Space toggles. Enter saves. Esc returns to search.",
     ));
-    render_lines(stdout, rendered_lines, &lines)?;
-    Ok(lines.len())
+    render_lines(stdout, rendered_lines, &lines)
 }
 
 fn question_line(message: &str) -> String {
@@ -584,13 +582,13 @@ fn visible_positions(len: usize, cursor: usize, page_size: usize) -> std::ops::R
     start..end
 }
 
-fn render_lines(stdout: &mut impl Write, rendered_lines: usize, lines: &[String]) -> Result<()> {
+fn render_lines(stdout: &mut impl Write, rendered_lines: usize, lines: &[String]) -> Result<usize> {
     clear_prompt(stdout, rendered_lines)?;
     for line in lines {
         write!(stdout, "{line}\r\n")?;
     }
     stdout.flush()?;
-    Ok(())
+    Ok(rendered_terminal_rows(lines, terminal_width()))
 }
 
 fn clear_prompt(stdout: &mut impl Write, rendered_lines: usize) -> Result<()> {
@@ -603,6 +601,44 @@ fn clear_prompt(stdout: &mut impl Write, rendered_lines: usize) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn terminal_width() -> usize {
+    terminal::size()
+        .map(|(columns, _)| columns as usize)
+        .unwrap_or(80)
+        .max(1)
+}
+
+fn rendered_terminal_rows(lines: &[String], width: usize) -> usize {
+    lines
+        .iter()
+        .map(|line| terminal_rows_for_line(line, width))
+        .sum()
+}
+
+fn terminal_rows_for_line(line: &str, width: usize) -> usize {
+    visible_columns(line).max(1).div_ceil(width.max(1))
+}
+
+fn visible_columns(line: &str) -> usize {
+    let mut chars = line.chars().peekable();
+    let mut columns = 0;
+
+    while let Some(character) = chars.next() {
+        if character == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for escape_character in chars.by_ref() {
+                if ('@'..='~').contains(&escape_character) {
+                    break;
+                }
+            }
+        } else {
+            columns += 1;
+        }
+    }
+
+    columns
 }
 
 fn read_prompt_key() -> Result<PromptKey> {
@@ -777,6 +813,22 @@ mod tests {
         assert!(output.contains("> ■ Spring Web [Web]"));
         assert!(output.contains("  □ Spring Data JPA [SQL]"));
         assert!(output.contains("Type to filter."));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_select_prompt_counts_wrapped_terminal_rows() -> anyhow::Result<()> {
+        let ids = vec!["web".to_string()];
+        let labels = vec![format!("Spring Web [Web] - {}", "a".repeat(1_000))];
+        let state = MultiSelectPromptState::new(ids, labels, &[]);
+        let mut output = Vec::new();
+
+        let rendered = render_multi_select_prompt(&mut output, 0, "Select dependencies", &state)?;
+
+        assert!(
+            rendered > 5,
+            "over-wide dependency rows should count terminal wraps so redraws can clear them"
+        );
         Ok(())
     }
 
