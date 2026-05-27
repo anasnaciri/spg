@@ -1,13 +1,24 @@
 use crate::{
     cli::{CacheCommand, Cli, Commands, ConfigCommand},
     config::{cache, paths::AppPaths, user_config},
+    initializr::{client::InitializrClient, metadata::InitializrMetadata},
 };
 use anyhow::{Context, Result};
 use inquire::Confirm;
-use std::io::{self, Write};
+use std::{
+    future::Future,
+    io::{self, Write},
+    pin::Pin,
+};
 
 pub trait Confirmation {
     fn confirm(&mut self, message: &str) -> Result<bool>;
+}
+
+pub trait MetadataProvider {
+    fn fetch_metadata<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<InitializrMetadata>> + 'a>>;
 }
 
 pub struct InquireConfirmation;
@@ -18,6 +29,14 @@ impl Confirmation for InquireConfirmation {
             .with_default(false)
             .prompt()
             .context("failed to read confirmation prompt")
+    }
+}
+
+impl MetadataProvider for InitializrClient {
+    fn fetch_metadata<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<InitializrMetadata>> + 'a>> {
+        Box::pin(async move { InitializrClient::fetch_metadata(self).await })
     }
 }
 
@@ -39,13 +58,34 @@ pub async fn run_with_paths(
     stderr: &mut impl Write,
     confirmation: &mut impl Confirmation,
 ) -> Result<()> {
+    let mut metadata_provider = InitializrClient::new_default()?;
+    run_with_services(
+        cli,
+        paths,
+        stdout,
+        stderr,
+        confirmation,
+        &mut metadata_provider,
+    )
+    .await
+}
+
+pub async fn run_with_services(
+    cli: Cli,
+    paths: &AppPaths,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    confirmation: &mut impl Confirmation,
+    metadata_provider: &mut impl MetadataProvider,
+) -> Result<()> {
     match cli.command {
         Commands::Init(args) => {
             let name = args.project_name.as_deref().unwrap_or("<prompt>");
             writeln!(stderr, "spg init is not implemented yet for {name}")?;
         }
         Commands::Deps => {
-            writeln!(stderr, "spg deps is not implemented yet")?;
+            let metadata = metadata_provider.fetch_metadata().await?;
+            print_dependencies(&metadata, stdout)?;
         }
         Commands::Config(ConfigCommand::Show) => {
             show_config(paths, stdout)?;
@@ -56,6 +96,25 @@ pub async fn run_with_paths(
         Commands::Cache(CacheCommand::Clear) => {
             clear_cache(paths, stdout)?;
         }
+    }
+
+    Ok(())
+}
+
+fn print_dependencies(metadata: &InitializrMetadata, stdout: &mut impl Write) -> Result<()> {
+    let dependencies = metadata.dependency_entries();
+
+    if dependencies.is_empty() {
+        writeln!(stdout, "No Spring Initializr dependencies found")?;
+        return Ok(());
+    }
+
+    for dependency in dependencies {
+        writeln!(
+            stdout,
+            "{}\t{}\t{}",
+            dependency.id, dependency.name, dependency.group
+        )?;
     }
 
     Ok(())
@@ -123,11 +182,14 @@ mod tests {
     use crate::{
         cli::Cli,
         config::{paths::AppPaths, user_config::UserConfig},
+        initializr::metadata::InitializrMetadata,
     };
     use clap::Parser;
     use std::{
         fs,
+        future::Future,
         path::{Path, PathBuf},
+        pin::Pin,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -153,6 +215,19 @@ mod tests {
     impl Confirmation for StaticConfirmation {
         fn confirm(&mut self, _message: &str) -> anyhow::Result<bool> {
             Ok(self.responses.remove(0))
+        }
+    }
+
+    struct StaticMetadataProvider {
+        metadata: InitializrMetadata,
+    }
+
+    impl MetadataProvider for StaticMetadataProvider {
+        fn fetch_metadata<'a>(
+            &'a mut self,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<InitializrMetadata>> + 'a>> {
+            let metadata = self.metadata.clone();
+            Box::pin(async move { Ok(metadata) })
         }
     }
 
@@ -276,6 +351,69 @@ mod tests {
 
         cleanup(&paths);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn deps_prints_dependency_catalog_from_metadata_provider() -> anyhow::Result<()> {
+        let paths = temp_paths("deps");
+        let cli = Cli::parse_from(["spg", "deps"]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::default();
+        let mut metadata = StaticMetadataProvider {
+            metadata: sample_metadata()?,
+        };
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut metadata,
+        )
+        .await?;
+
+        let output = String::from_utf8(stdout)?;
+        assert!(output.contains("web\tSpring Web\tWeb"));
+        assert!(output.contains("data-jpa\tSpring Data JPA\tSQL"));
+        assert!(stderr.is_empty());
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    fn sample_metadata() -> serde_json::Result<InitializrMetadata> {
+        serde_json::from_str(
+            r#"
+            {
+              "dependencies": {
+                "values": [
+                  {
+                    "name": "Web",
+                    "values": [
+                      {
+                        "id": "web",
+                        "name": "Spring Web",
+                        "description": "Build web applications."
+                      }
+                    ]
+                  },
+                  {
+                    "name": "SQL",
+                    "values": [
+                      {
+                        "id": "data-jpa",
+                        "name": "Spring Data JPA",
+                        "description": "Persist data in SQL stores."
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+            "#,
+        )
     }
 
     fn temp_paths(test_name: &str) -> AppPaths {
