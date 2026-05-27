@@ -139,13 +139,13 @@ mod tests {
             "--defaults",
             "--refresh",
             "--group-id",
-            "com.anas",
+            "com.example",
             "--artifact-id",
             "orders",
             "--description",
             "Orders API",
             "--package-name",
-            "com.anas.orders",
+            "com.example.orders",
             "--build",
             "maven",
             "--type",
@@ -174,10 +174,10 @@ mod tests {
         assert_eq!(args.project_name.as_deref(), Some("my-api"));
         assert!(args.defaults);
         assert!(args.refresh);
-        assert_eq!(args.group_id.as_deref(), Some("com.anas"));
+        assert_eq!(args.group_id.as_deref(), Some("com.example"));
         assert_eq!(args.artifact_id.as_deref(), Some("orders"));
         assert_eq!(args.description.as_deref(), Some("Orders API"));
-        assert_eq!(args.package_name.as_deref(), Some("com.anas.orders"));
+        assert_eq!(args.package_name.as_deref(), Some("com.example.orders"));
         assert_eq!(args.build.as_deref(), Some("maven"));
         assert_eq!(args.project_type.as_deref(), Some("maven-project"));
         assert_eq!(args.language.as_deref(), Some("java"));

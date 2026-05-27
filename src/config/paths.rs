@@ -10,7 +10,7 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn discover() -> Result<Self> {
-        let project_dirs = ProjectDirs::from("dev", "anasnaciri", "spg")
+        let project_dirs = ProjectDirs::from("dev", "spg", "spg")
             .context("could not resolve OS-specific config and cache directories for spg")?;
 
         Ok(Self::from_dirs(

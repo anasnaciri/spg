@@ -313,7 +313,7 @@ mod tests {
     async fn config_show_prints_saved_toml() -> anyhow::Result<()> {
         let paths = temp_paths("config-show");
         let config = UserConfig {
-            group_id: Some("com.anas".to_string()),
+            group_id: Some("com.example".to_string()),
             language: Some("java".to_string()),
             build: Some("maven".to_string()),
             packaging: Some("jar".to_string()),
@@ -332,7 +332,7 @@ mod tests {
         run_with_paths(cli, &paths, &mut stdout, &mut stderr, &mut confirmation).await?;
 
         let output = String::from_utf8(stdout)?;
-        assert!(output.contains("group_id = \"com.anas\""));
+        assert!(output.contains("group_id = \"com.example\""));
         assert!(output.contains("dependencies = [\"web\", \"validation\"]"));
         assert!(stderr.is_empty());
 
@@ -364,7 +364,7 @@ mod tests {
         crate::config::user_config::save(
             &paths.user_config_file,
             &UserConfig {
-                group_id: Some("com.anas".to_string()),
+                group_id: Some("com.example".to_string()),
                 ..UserConfig::default()
             },
         )?;
@@ -390,7 +390,7 @@ mod tests {
         crate::config::user_config::save(
             &paths.user_config_file,
             &UserConfig {
-                group_id: Some("com.anas".to_string()),
+                group_id: Some("com.example".to_string()),
                 ..UserConfig::default()
             },
         )?;

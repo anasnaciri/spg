@@ -82,7 +82,7 @@ mod tests {
     fn save_and_load_round_trips_toml_config() -> anyhow::Result<()> {
         let path = temp_file("user-config-round-trip");
         let config = UserConfig {
-            group_id: Some("com.anas".to_string()),
+            group_id: Some("com.example".to_string()),
             language: Some("java".to_string()),
             build: Some("maven".to_string()),
             packaging: Some("jar".to_string()),
@@ -96,7 +96,7 @@ mod tests {
 
         assert_eq!(load(&path)?, Some(config));
         let raw = fs::read_to_string(&path)?;
-        assert!(raw.contains("group_id = \"com.anas\""));
+        assert!(raw.contains("group_id = \"com.example\""));
         assert!(raw.contains("dependencies = [\"web\", \"validation\"]"));
 
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
