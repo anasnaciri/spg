@@ -23,7 +23,7 @@ impl GenerationParams {
         let mut pairs = vec![
             ("type", self.project_type.clone()),
             ("language", self.language.clone()),
-            ("bootVersion", self.boot_version.clone()),
+            ("bootVersion", starter_boot_version(&self.boot_version)),
             ("baseDir", self.base_dir.clone()),
             ("groupId", self.group_id.clone()),
             ("artifactId", self.artifact_id.clone()),
@@ -76,6 +76,13 @@ impl GenerationParams {
 
         Ok(())
     }
+}
+
+fn starter_boot_version(version: &str) -> String {
+    version
+        .strip_suffix(".RELEASE")
+        .unwrap_or(version)
+        .to_string()
 }
 
 fn validate_metadata_value(label: &str, value: &str, field: &SelectField) -> Result<()> {
@@ -259,6 +266,22 @@ mod tests {
                 .iter()
                 .all(|(name, _)| *name != "dependencies")
         );
+    }
+
+    #[test]
+    fn generation_params_normalize_release_boot_version_for_request() {
+        let params = GenerationParams {
+            boot_version: "4.0.6.RELEASE".to_string(),
+            ..sample_params()
+        };
+
+        let boot_version = params
+            .query_pairs()
+            .into_iter()
+            .find(|(name, _)| *name == "bootVersion")
+            .map(|(_, value)| value);
+
+        assert_eq!(boot_version.as_deref(), Some("4.0.6"));
     }
 
     #[test]
