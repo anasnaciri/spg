@@ -1159,11 +1159,13 @@ mod tests {
                 "interactive-demo",
                 "Interactive demo",
                 "com.acme.demo",
+                "web",
+                "",
             ]
             .into_iter()
             .map(String::from)
             .collect(),
-            select_responses: ["maven-project", "java", "3.5.0", "17", "jar"]
+            select_responses: ["maven-project", "java", "3.5.0", "17", "jar", "web"]
                 .into_iter()
                 .map(String::from)
                 .collect(),
@@ -1190,8 +1192,12 @@ mod tests {
         .await?;
 
         assert_eq!(
-            prompter.text_messages,
+            prompter.text_messages[..4],
             ["Group ID?", "Artifact ID?", "Description?", "Package name?",]
+        );
+        assert!(
+            prompter.text_messages[4].starts_with("Search dependencies"),
+            "interactive picker should run after the standard text fields"
         );
         assert_eq!(
             prompter.select_messages,
@@ -1201,6 +1207,7 @@ mod tests {
                 "Spring Boot version?",
                 "Java version?",
                 "Packaging?",
+                "Add which dependency?",
             ]
         );
         let params = &starter_zip.captured[0];
@@ -1212,6 +1219,7 @@ mod tests {
         assert_eq!(params.language, "java");
         assert_eq!(params.java_version, "17");
         assert_eq!(params.packaging, "jar");
+        assert_eq!(params.dependencies, ["web"]);
 
         cleanup(&paths);
         Ok(())

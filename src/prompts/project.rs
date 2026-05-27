@@ -5,7 +5,7 @@ use crate::{
         generate::GenerationParams,
         metadata::{InitializrMetadata, SelectField},
     },
-    prompts::ui::Prompter,
+    prompts::{dependencies::pick_dependencies_interactively, ui::Prompter},
 };
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -216,12 +216,13 @@ impl ProjectPlan {
             }
         };
 
-        let dependencies = if args.dependencies.is_empty() {
-            config
-                .map(|config| config.dependencies.clone())
-                .unwrap_or_default()
-        } else {
+        let dependencies = if !args.dependencies.is_empty() {
             args.dependencies.clone()
+        } else {
+            let seed = config
+                .map(|config| config.dependencies.clone())
+                .unwrap_or_default();
+            pick_dependencies_interactively(metadata, &seed, prompter)?
         };
 
         Ok(Self {
@@ -508,6 +509,7 @@ mod tests {
             artifact_id: Some("orders".to_string()),
             language: Some("kotlin".to_string()),
             packaging: Some("war".to_string()),
+            dependencies: vec!["web".to_string()],
             ..empty_init_args()
         };
         let mut prompter = StaticPrompter::default()
@@ -548,7 +550,10 @@ mod tests {
 
     #[test]
     fn interactive_plan_prefills_defaults_from_saved_config_then_metadata() -> anyhow::Result<()> {
-        let args = empty_init_args();
+        let args = InitArgs {
+            dependencies: vec!["web".to_string()],
+            ..empty_init_args()
+        };
         let config = UserConfig {
             group_id: Some("com.saved".to_string()),
             language: Some("kotlin".to_string()),
@@ -598,6 +603,7 @@ mod tests {
             group_id: Some("com.example".to_string()),
             output_dir: Some(PathBuf::from(".")),
             build: Some("gradle".to_string()),
+            dependencies: vec!["web".to_string()],
             ..empty_init_args()
         };
         let mut prompter = StaticPrompter::default();
