@@ -2,6 +2,7 @@ use crate::{
     cli::{CacheCommand, Cli, Commands, ConfigCommand},
     config::{cache, paths::AppPaths, user_config},
     initializr::{client::InitializrClient, metadata::InitializrMetadata},
+    prompts::dependencies,
 };
 use anyhow::{Context, Result};
 use inquire::Confirm;
@@ -141,9 +142,9 @@ pub async fn run_with_services(
             let name = args.project_name.as_deref().unwrap_or("<prompt>");
             writeln!(stderr, "spg init is not implemented yet for {name}")?;
         }
-        Commands::Deps => {
+        Commands::Deps(args) => {
             let metadata = metadata_provider.fetch_metadata().await?;
-            print_dependencies(&metadata, stdout)?;
+            print_dependencies(&metadata, args.query.as_deref(), stdout)?;
         }
         Commands::Config(ConfigCommand::Show) => {
             show_config(paths, stdout)?;
@@ -159,8 +160,12 @@ pub async fn run_with_services(
     Ok(())
 }
 
-fn print_dependencies(metadata: &InitializrMetadata, stdout: &mut impl Write) -> Result<()> {
-    let dependencies = metadata.dependency_entries();
+fn print_dependencies(
+    metadata: &InitializrMetadata,
+    query: Option<&str>,
+    stdout: &mut impl Write,
+) -> Result<()> {
+    let dependencies = dependencies::search_dependencies(metadata, query.unwrap_or_default());
 
     if dependencies.is_empty() {
         writeln!(stdout, "No Spring Initializr dependencies found")?;
@@ -449,6 +454,36 @@ mod tests {
 
         let output = String::from_utf8(stdout)?;
         assert!(output.contains("web\tSpring Web\tWeb"));
+        assert!(output.contains("data-jpa\tSpring Data JPA\tSQL"));
+        assert!(stderr.is_empty());
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deps_filters_dependency_catalog_with_query() -> anyhow::Result<()> {
+        let paths = temp_paths("deps-query");
+        let cli = Cli::parse_from(["spg", "deps", "jpa"]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::default();
+        let mut metadata = StaticMetadataProvider {
+            metadata: sample_metadata()?,
+        };
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut metadata,
+        )
+        .await?;
+
+        let output = String::from_utf8(stdout)?;
+        assert!(!output.contains("web\tSpring Web\tWeb"));
         assert!(output.contains("data-jpa\tSpring Data JPA\tSQL"));
         assert!(stderr.is_empty());
 

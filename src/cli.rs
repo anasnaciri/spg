@@ -30,7 +30,7 @@ pub enum Commands {
     Init(Box<InitArgs>),
 
     /// Search Spring Initializr dependencies.
-    Deps,
+    Deps(DepsArgs),
 
     /// Manage saved user defaults.
     #[command(subcommand)]
@@ -101,6 +101,12 @@ pub struct InitArgs {
     /// Directory where the project folder should be written.
     #[arg(long)]
     pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub struct DepsArgs {
+    /// Optional search query for filtering dependencies.
+    pub query: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -185,7 +191,18 @@ mod tests {
     #[test]
     fn parses_top_level_commands() {
         let deps = Cli::parse_from(["spg", "deps"]);
-        assert!(matches!(deps.command, Commands::Deps));
+        assert!(matches!(
+            deps.command,
+            Commands::Deps(DepsArgs { query: None })
+        ));
+
+        let deps_query = Cli::parse_from(["spg", "deps", "web"]);
+        assert!(matches!(
+            deps_query.command,
+            Commands::Deps(DepsArgs {
+                query: Some(query)
+            }) if query == "web"
+        ));
 
         let config_show = Cli::parse_from(["spg", "config", "show"]);
         assert!(matches!(
