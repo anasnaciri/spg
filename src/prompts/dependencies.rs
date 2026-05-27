@@ -5,8 +5,6 @@ use crate::{
 use anyhow::Result;
 use std::collections::HashMap;
 
-const FINISH_DEPENDENCY_SELECTION_ID: &str = "Done selecting dependencies";
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DependencySelection {
     entries: Vec<DependencyEntry>,
@@ -28,10 +26,6 @@ impl DependencySelection {
 
     pub fn entries(&self) -> &[DependencyEntry] {
         &self.entries
-    }
-
-    fn contains(&self, id: &str) -> bool {
-        self.entries.iter().any(|entry| entry.id == id)
     }
 }
 
@@ -94,92 +88,20 @@ pub fn pick_dependencies_interactively(
         return Ok(selection.ids());
     }
 
-    let mut last_no_match: Option<String> = None;
-    loop {
-        let prompt = format!(
-            "Search dependencies (blank to browse all; {})",
-            render_picker_status(&selection, last_no_match.as_deref())
-        );
-        let query = prompter.text(&prompt, Some(""))?;
-        let trimmed = query.trim();
+    if !prompter.confirm("Add dependencies?", true)? {
+        return Ok(Vec::new());
+    }
 
-        let browsing_all = trimmed.is_empty();
-        let matches = if browsing_all {
-            entries.clone()
-        } else {
-            search_dependencies(metadata, trimmed)
-        };
-        if matches.is_empty() {
-            last_no_match = Some(trimmed.to_string());
-            continue;
-        }
-        last_no_match = None;
-
-        let options = dependency_options(&matches, browsing_all);
-        let default_id = if browsing_all {
-            dependency_browse_default(&matches, &selection)
-        } else {
-            dependency_select_default(&matches, &selection)
-        };
-        let chosen_id =
-            prompter.select("Add which dependency?", &options, default_id.as_deref())?;
-        if chosen_id == FINISH_DEPENDENCY_SELECTION_ID {
-            break;
-        }
-        if let Some(entry) = by_id.get(&chosen_id) {
-            selection.add(entry.clone());
+    let options: Vec<SelectOption> = entries.iter().map(dependency_option).collect();
+    let selected_ids = prompter.multi_select("Select dependencies", &options, &selection.ids())?;
+    let mut selected = DependencySelection::default();
+    for id in selected_ids {
+        if let Some(entry) = by_id.get(&id) {
+            selected.add(entry.clone());
         }
     }
 
-    Ok(selection.ids())
-}
-
-fn dependency_select_default(
-    matches: &[DependencyEntry],
-    selection: &DependencySelection,
-) -> Option<String> {
-    matches
-        .iter()
-        .find(|entry| !selection.contains(&entry.id))
-        .or_else(|| matches.first())
-        .map(|entry| entry.id.clone())
-}
-
-fn dependency_browse_default(
-    matches: &[DependencyEntry],
-    selection: &DependencySelection,
-) -> Option<String> {
-    matches
-        .iter()
-        .find(|entry| !selection.contains(&entry.id))
-        .map(|entry| entry.id.clone())
-        .or_else(|| Some(FINISH_DEPENDENCY_SELECTION_ID.to_string()))
-}
-
-fn render_picker_status(selection: &DependencySelection, last_no_match: Option<&str>) -> String {
-    let selected = if selection.entries().is_empty() {
-        "no dependencies selected".to_string()
-    } else {
-        format!("selected: {}", selection.ids().join(", "))
-    };
-    match last_no_match {
-        Some(query) => format!("no matches for '{query}'; {selected}"),
-        None => selected,
-    }
-}
-
-fn dependency_options(entries: &[DependencyEntry], include_finish: bool) -> Vec<SelectOption> {
-    let mut options: Vec<SelectOption> = entries.iter().map(dependency_option).collect();
-    if include_finish {
-        options.insert(
-            0,
-            SelectOption {
-                id: FINISH_DEPENDENCY_SELECTION_ID.to_string(),
-                name: FINISH_DEPENDENCY_SELECTION_ID.to_string(),
-            },
-        );
-    }
-    options
+    Ok(selected.ids())
 }
 
 fn dependency_option(entry: &DependencyEntry) -> SelectOption {
@@ -199,6 +121,9 @@ mod tests {
     use super::*;
     use crate::initializr::metadata::{
         Dependency, DependencyGroup, DependencyGroupField, InitializrMetadata,
+    };
+    use crate::prompts::ui::{
+        MultiSelectFocus, MultiSelectPromptOutcome, MultiSelectPromptState, PromptKey,
     };
 
     #[test]
@@ -262,9 +187,15 @@ mod tests {
     struct ScriptedPrompter {
         text_responses: std::collections::VecDeque<String>,
         select_responses: std::collections::VecDeque<String>,
+        confirm_responses: std::collections::VecDeque<bool>,
+        multi_select_responses: std::collections::VecDeque<Vec<String>>,
         text_prompts: Vec<String>,
         select_prompts: Vec<String>,
+        confirm_prompts: Vec<(String, bool)>,
+        multi_select_prompts: Vec<String>,
         select_option_ids: Vec<Vec<String>>,
+        multi_select_option_ids: Vec<Vec<String>>,
+        multi_select_default_ids: Vec<Vec<String>>,
         select_defaults: Vec<Option<String>>,
     }
 
@@ -291,16 +222,37 @@ mod tests {
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("no select response scripted for: {message}"))
         }
+
+        fn confirm(&mut self, message: &str, default: bool) -> anyhow::Result<bool> {
+            self.confirm_prompts.push((message.to_string(), default));
+            self.confirm_responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no confirmation response scripted for: {message}"))
+        }
+
+        fn multi_select(
+            &mut self,
+            message: &str,
+            options: &[crate::initializr::metadata::SelectOption],
+            default_ids: &[String],
+        ) -> anyhow::Result<Vec<String>> {
+            self.multi_select_prompts.push(message.to_string());
+            self.multi_select_option_ids
+                .push(options.iter().map(|option| option.id.clone()).collect());
+            self.multi_select_default_ids.push(default_ids.to_vec());
+            self.multi_select_responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no multi-select response scripted for: {message}"))
+        }
     }
 
     #[test]
-    fn dependency_picker_loops_until_user_selects_done_from_browse_list() -> anyhow::Result<()> {
+    fn dependency_picker_asks_before_opening_multi_select() -> anyhow::Result<()> {
         let metadata = sample_metadata();
         let mut prompter = ScriptedPrompter {
-            text_responses: ["web", "jpa", ""].into_iter().map(String::from).collect(),
-            select_responses: ["web", "data-jpa", FINISH_DEPENDENCY_SELECTION_ID]
+            confirm_responses: [true].into_iter().collect(),
+            multi_select_responses: [vec!["web".to_string(), "data-jpa".to_string()]]
                 .into_iter()
-                .map(String::from)
                 .collect(),
             ..ScriptedPrompter::default()
         };
@@ -308,63 +260,31 @@ mod tests {
         let selected = pick_dependencies_interactively(&metadata, &[], &mut prompter)?;
 
         assert_eq!(selected, ["web", "data-jpa"]);
-        assert_eq!(prompter.text_prompts.len(), 3);
-        assert!(prompter.text_prompts[0].contains("no dependencies selected"));
-        assert!(prompter.text_prompts[1].contains("selected: web"));
-        assert_eq!(prompter.select_option_ids[1], ["data-jpa"]);
+        assert_eq!(
+            prompter.confirm_prompts,
+            [("Add dependencies?".to_string(), true)]
+        );
+        assert_eq!(prompter.multi_select_prompts, ["Select dependencies"]);
+        assert_eq!(
+            prompter.multi_select_option_ids[0],
+            ["web", "data-jpa", "devtools"]
+        );
         Ok(())
     }
 
     #[test]
-    fn dependency_picker_defaults_select_cursor_to_first_unselected_match() -> anyhow::Result<()> {
+    fn dependency_picker_skips_dependencies_when_declined() -> anyhow::Result<()> {
         let metadata = sample_metadata();
         let mut prompter = ScriptedPrompter {
-            text_responses: ["spring", ""].into_iter().map(String::from).collect(),
-            select_responses: ["data-jpa", FINISH_DEPENDENCY_SELECTION_ID]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            confirm_responses: [false].into_iter().collect(),
             ..ScriptedPrompter::default()
         };
 
         let selected =
             pick_dependencies_interactively(&metadata, &["web".to_string()], &mut prompter)?;
 
-        assert_eq!(selected, ["web", "data-jpa"]);
-        assert_eq!(
-            prompter.select_option_ids[0],
-            ["web", "data-jpa", "devtools"]
-        );
-        assert_eq!(prompter.select_defaults[0], Some("data-jpa".to_string()));
-        Ok(())
-    }
-
-    #[test]
-    fn dependency_picker_can_browse_all_dependencies_from_blank_search() -> anyhow::Result<()> {
-        let metadata = sample_metadata();
-        let mut prompter = ScriptedPrompter {
-            text_responses: ["", ""].into_iter().map(String::from).collect(),
-            select_responses: ["data-jpa", FINISH_DEPENDENCY_SELECTION_ID]
-                .into_iter()
-                .map(String::from)
-                .collect(),
-            ..ScriptedPrompter::default()
-        };
-
-        let selected = pick_dependencies_interactively(&metadata, &[], &mut prompter)?;
-
-        assert_eq!(selected, ["data-jpa"]);
-        assert_eq!(
-            prompter.select_option_ids[0],
-            [
-                FINISH_DEPENDENCY_SELECTION_ID,
-                "web",
-                "data-jpa",
-                "devtools"
-            ]
-        );
-        assert_eq!(prompter.select_defaults[0], Some("web".to_string()));
-        assert_eq!(prompter.select_defaults[1], Some("web".to_string()));
+        assert!(selected.is_empty());
+        assert!(prompter.multi_select_prompts.is_empty());
         Ok(())
     }
 
@@ -372,10 +292,9 @@ mod tests {
     fn dependency_picker_seeds_from_saved_config_and_drops_unknown_ids() -> anyhow::Result<()> {
         let metadata = sample_metadata();
         let mut prompter = ScriptedPrompter {
-            text_responses: [""].into_iter().map(String::from).collect(),
-            select_responses: [FINISH_DEPENDENCY_SELECTION_ID]
+            confirm_responses: [true].into_iter().collect(),
+            multi_select_responses: [vec!["web".to_string(), "data-jpa".to_string()]]
                 .into_iter()
-                .map(String::from)
                 .collect(),
             ..ScriptedPrompter::default()
         };
@@ -386,35 +305,115 @@ mod tests {
             &mut prompter,
         )?;
 
-        assert_eq!(selected, ["web"]);
-        assert!(prompter.text_prompts[0].contains("selected: web"));
+        assert_eq!(selected, ["web", "data-jpa"]);
+        assert_eq!(prompter.multi_select_default_ids[0], ["web"]);
         Ok(())
     }
 
     #[test]
-    fn dependency_picker_reports_no_matches_in_next_prompt_and_ignores_duplicates()
-    -> anyhow::Result<()> {
+    fn dependency_picker_filters_unknown_multi_select_results() -> anyhow::Result<()> {
         let metadata = sample_metadata();
         let mut prompter = ScriptedPrompter {
-            text_responses: ["nothing", "web", "web", ""]
+            confirm_responses: [true].into_iter().collect(),
+            multi_select_responses: [vec!["web".to_string(), "stale".to_string()]]
                 .into_iter()
-                .map(String::from)
-                .collect(),
-            select_responses: ["web", "web", FINISH_DEPENDENCY_SELECTION_ID]
-                .into_iter()
-                .map(String::from)
                 .collect(),
             ..ScriptedPrompter::default()
         };
 
         let selected = pick_dependencies_interactively(&metadata, &[], &mut prompter)?;
 
-        assert_eq!(selected, ["web"], "duplicate selection must be ignored");
-        assert!(
-            prompter.text_prompts[1].contains("no matches for 'nothing'"),
-            "next prompt should surface the missed query"
-        );
+        assert_eq!(selected, ["web"]);
         Ok(())
+    }
+
+    #[test]
+    fn dependency_picker_state_keeps_j_and_k_as_search_text_until_list_is_focused() {
+        let (ids, labels) = dependency_prompt_options(&sample_metadata());
+        let mut state = MultiSelectPromptState::new(ids, labels, &[]);
+
+        assert_eq!(state.focus(), MultiSelectFocus::Search);
+        assert_eq!(
+            state.apply_key(PromptKey::Char('j')),
+            MultiSelectPromptOutcome::Continue
+        );
+        assert_eq!(state.query(), "j");
+        assert_eq!(
+            state.apply_key(PromptKey::Backspace),
+            MultiSelectPromptOutcome::Continue
+        );
+        assert_eq!(
+            state.apply_key(PromptKey::Char('k')),
+            MultiSelectPromptOutcome::Continue
+        );
+        assert_eq!(state.query(), "k");
+
+        assert_eq!(
+            state.apply_key(PromptKey::Backspace),
+            MultiSelectPromptOutcome::Continue
+        );
+        assert_eq!(
+            state.apply_key(PromptKey::Tab),
+            MultiSelectPromptOutcome::Continue
+        );
+        assert_eq!(state.focus(), MultiSelectFocus::List);
+        assert_eq!(
+            state.apply_key(PromptKey::Char('j')),
+            MultiSelectPromptOutcome::Continue
+        );
+        assert_eq!(state.query(), "");
+    }
+
+    #[test]
+    fn dependency_picker_state_supports_tab_shift_tab_space_and_escape_to_search() {
+        let metadata = sample_metadata();
+        let (ids, labels) = dependency_prompt_options(&metadata);
+        let mut state = MultiSelectPromptState::new(ids, labels, &[]);
+
+        assert_eq!(
+            state.apply_key(PromptKey::Tab),
+            MultiSelectPromptOutcome::Continue
+        );
+        assert_eq!(state.focus(), MultiSelectFocus::List);
+        assert_eq!(state.cursor_id(), Some("web"));
+        assert_eq!(
+            state.apply_key(PromptKey::Tab),
+            MultiSelectPromptOutcome::Continue
+        );
+        assert_eq!(state.cursor_id(), Some("data-jpa"));
+        assert_eq!(
+            state.apply_key(PromptKey::BackTab),
+            MultiSelectPromptOutcome::Continue
+        );
+        assert_eq!(state.cursor_id(), Some("web"));
+        assert_eq!(
+            state.apply_key(PromptKey::Space),
+            MultiSelectPromptOutcome::Continue
+        );
+        assert_eq!(state.selected_ids(), ["web"]);
+        assert_eq!(
+            state.rendered_options()[0],
+            "■ Spring Web [Web] - Build web, including RESTful, applications using Spring MVC."
+        );
+        assert!(state.rendered_options()[1].starts_with("□ Spring Data JPA"));
+
+        assert_eq!(
+            state.apply_key(PromptKey::Escape),
+            MultiSelectPromptOutcome::Continue
+        );
+        assert_eq!(state.focus(), MultiSelectFocus::Search);
+        assert_eq!(state.selected_ids(), ["web"]);
+    }
+
+    fn dependency_prompt_options(metadata: &InitializrMetadata) -> (Vec<String>, Vec<String>) {
+        let options: Vec<SelectOption> = metadata
+            .dependency_entries()
+            .iter()
+            .map(dependency_option)
+            .collect();
+        let ids = options.iter().map(|option| option.id.clone()).collect();
+        let labels = options.iter().map(|option| option.name.clone()).collect();
+        (ids, labels)
     }
 
     #[test]

@@ -360,12 +360,28 @@ fn prepare_output_dir(output_dir: &Path) -> Result<()> {
 fn print_success(stdout: &mut impl Write, plan: &ProjectPlan, project_dir: &Path) -> Result<()> {
     writeln!(
         stdout,
-        "Created Spring Boot project at {}",
+        "Success! Created {} at {}",
+        plan.generation.name,
         project_dir.display()
     )?;
+    writeln!(
+        stdout,
+        "Spring Boot {} | Java {} | {} | {}",
+        plan.generation.boot_version,
+        plan.generation.java_version,
+        plan.generation.project_type,
+        plan.generation.packaging
+    )?;
+    if !plan.generation.dependencies.is_empty() {
+        writeln!(
+            stdout,
+            "Dependencies: {}",
+            plan.generation.dependencies.join(", ")
+        )?;
+    }
     writeln!(stdout)?;
     writeln!(stdout, "Next steps:")?;
-    writeln!(stdout, "  cd {}", plan.generation.base_dir)?;
+    writeln!(stdout, "  cd {}", project_dir.display())?;
     let project_type = plan.generation.project_type.as_str();
     if project_type.contains("gradle") {
         writeln!(stdout, "  ./gradlew bootRun")?;
@@ -523,8 +539,12 @@ mod tests {
     struct ScriptedPrompter {
         text_responses: std::collections::VecDeque<String>,
         select_responses: std::collections::VecDeque<String>,
+        confirm_responses: std::collections::VecDeque<bool>,
+        multi_select_responses: std::collections::VecDeque<Vec<String>>,
         text_messages: Vec<String>,
         select_messages: Vec<String>,
+        confirm_messages: Vec<(String, bool)>,
+        multi_select_messages: Vec<String>,
     }
 
     impl Prompter for ScriptedPrompter {
@@ -545,6 +565,25 @@ mod tests {
             self.select_responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("no scripted select response for {message:?}"))
+        }
+
+        fn confirm(&mut self, message: &str, default: bool) -> anyhow::Result<bool> {
+            self.confirm_messages.push((message.to_string(), default));
+            self.confirm_responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no scripted confirm response for {message:?}"))
+        }
+
+        fn multi_select(
+            &mut self,
+            message: &str,
+            _options: &[crate::initializr::metadata::SelectOption],
+            _default_ids: &[String],
+        ) -> anyhow::Result<Vec<String>> {
+            self.multi_select_messages.push(message.to_string());
+            self.multi_select_responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("no scripted multi-select response for {message:?}"))
         }
     }
 
@@ -994,9 +1033,12 @@ mod tests {
 
         let output = String::from_utf8(stdout)?;
         assert!(output.contains(
-            format!("Created Spring Boot project at {}", project_dir.display()).as_str()
+            format!("Success! Created orders-api at {}", project_dir.display()).as_str()
         ));
-        assert!(output.contains("cd orders-api"));
+        assert!(output.contains(format!("cd {}", project_dir.display()).as_str()));
+        assert!(output.contains("Spring Boot 3.5.0"));
+        assert!(output.contains("Java 17"));
+        assert!(output.contains("maven-project"));
         assert!(output.contains("./mvnw spring-boot:run"));
         assert!(stderr.is_empty());
 
@@ -1311,24 +1353,16 @@ mod tests {
                 "interactive-demo",
                 "Interactive demo",
                 "com.acme.demo",
-                "web",
-                "",
             ]
             .into_iter()
             .map(String::from)
             .collect(),
-            select_responses: [
-                "maven-project",
-                "java",
-                "3.5.0",
-                "17",
-                "jar",
-                "web",
-                "Done selecting dependencies",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
+            select_responses: ["maven-project", "java", "3.5.0", "17", "jar"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            confirm_responses: [true].into_iter().collect(),
+            multi_select_responses: [vec!["web".to_string()]].into_iter().collect(),
             ..ScriptedPrompter::default()
         };
         let mut metadata = StaticMetadataProvider {
@@ -1355,10 +1389,12 @@ mod tests {
             prompter.text_messages[..4],
             ["Group ID?", "Artifact ID?", "Description?", "Package name?",]
         );
-        assert!(
-            prompter.text_messages[4].starts_with("Search dependencies"),
-            "interactive picker should run after the standard text fields"
+        assert_eq!(
+            prompter.confirm_messages,
+            [("Add dependencies?".to_string(), true)],
+            "dependency pre-prompt should run after the standard text fields"
         );
+        assert_eq!(prompter.multi_select_messages, ["Select dependencies"]);
         assert_eq!(
             prompter.select_messages,
             [
@@ -1367,8 +1403,6 @@ mod tests {
                 "Spring Boot version?",
                 "Java version?",
                 "Packaging?",
-                "Add which dependency?",
-                "Add which dependency?",
             ]
         );
         let params = &starter_zip.captured[0];
