@@ -1,4 +1,4 @@
-use crate::initializr::metadata::InitializrMetadata;
+use crate::initializr::{generate::GenerationParams, metadata::InitializrMetadata};
 use anyhow::{Context, Result, bail};
 use reqwest::{
     Client, Request, Url,
@@ -39,6 +39,16 @@ impl InitializrClient {
             .context("failed to build Spring Initializr metadata request")
     }
 
+    pub fn starter_zip_request(&self, params: &GenerationParams) -> Result<Request> {
+        let url = params.starter_zip_url(&self.base_url)?;
+
+        self.http
+            .get(url)
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .build()
+            .context("failed to build Spring Initializr generation request")
+    }
+
     pub async fn fetch_metadata(&self) -> Result<InitializrMetadata> {
         let request = self.metadata_request()?;
         let response = self
@@ -62,6 +72,7 @@ impl InitializrClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::initializr::generate::GenerationParams;
     use reqwest::header::{ACCEPT, USER_AGENT};
 
     #[test]
@@ -77,5 +88,43 @@ mod tests {
         assert_eq!(request.headers().get(USER_AGENT).unwrap(), USER_AGENT_VALUE);
 
         Ok(())
+    }
+
+    #[test]
+    fn starter_zip_request_targets_generation_endpoint_with_query() -> anyhow::Result<()> {
+        let client = InitializrClient::new("https://start.example")?;
+        let request = client.starter_zip_request(&sample_generation_params())?;
+
+        assert_eq!(request.url().scheme(), "https");
+        assert_eq!(request.url().host_str(), Some("start.example"));
+        assert_eq!(request.url().path(), "/starter.zip");
+        assert!(
+            request
+                .url()
+                .query()
+                .unwrap()
+                .contains("type=maven-project")
+        );
+        assert!(request.url().query().unwrap().contains("dependencies=web"));
+        assert_eq!(request.headers().get(USER_AGENT).unwrap(), USER_AGENT_VALUE);
+
+        Ok(())
+    }
+
+    fn sample_generation_params() -> GenerationParams {
+        GenerationParams {
+            project_type: "maven-project".to_string(),
+            language: "java".to_string(),
+            boot_version: "3.5.0".to_string(),
+            base_dir: "orders-api".to_string(),
+            group_id: "com.anas".to_string(),
+            artifact_id: "orders".to_string(),
+            name: "orders-api".to_string(),
+            description: "Orders API".to_string(),
+            package_name: "com.anas.orders".to_string(),
+            packaging: "jar".to_string(),
+            java_version: "21".to_string(),
+            dependencies: vec!["web".to_string()],
+        }
     }
 }
