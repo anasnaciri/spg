@@ -240,18 +240,22 @@ async fn run_init(
     prepare_output_dir(&plan.output_dir)?;
 
     let project_dir = plan.output_dir.join(&plan.generation.base_dir);
-    if project_dir.exists()
-        && !confirmation.confirm(&format!(
+    if project_dir.exists() {
+        if args.defaults {
+            bail!(
+                "{} already exists. Remove it or pass --output-dir before retrying.",
+                project_dir.display()
+            );
+        }
+        if !confirmation.confirm(&format!(
             "{} already exists. Overwrite?",
             project_dir.display()
-        ))?
-    {
-        writeln!(
-            stdout,
-            "Aborted: kept existing project at {}",
-            project_dir.display()
-        )?;
-        return Ok(());
+        ))? {
+            bail!(
+                "aborted: existing project at {} was not overwritten",
+                project_dir.display()
+            );
+        }
     }
 
     let archive = starter_zip_provider
@@ -1049,9 +1053,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_aborts_when_user_declines_overwrite_of_existing_project_folder()
-    -> anyhow::Result<()> {
-        let (paths, root) = temp_paths_with_root("init-overwrite-declined");
+    async fn init_with_defaults_bails_when_target_directory_already_exists() -> anyhow::Result<()> {
+        let (paths, root) = temp_paths_with_root("init-defaults-existing-target");
         let output_dir = root.join("projects");
         let existing = output_dir.join("demo");
         fs::create_dir_all(&existing)?;
@@ -1067,6 +1070,77 @@ mod tests {
         ]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::default();
+        let mut prompter = UnusedPrompter;
+        let mut metadata = StaticMetadataProvider {
+            metadata: full_sample_metadata()?,
+        };
+        let mut starter_zip = StaticStarterZipProvider {
+            bytes: make_demo_zip("demo")?,
+            captured: Vec::new(),
+        };
+
+        let error = run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut prompter,
+            &mut metadata,
+            &mut starter_zip,
+        )
+        .await
+        .expect_err("--defaults must not prompt when target exists; should bail");
+
+        let message = error.to_string();
+        assert!(message.contains("already exists"), "got: {message}");
+        assert!(message.contains("--output-dir"), "got: {message}");
+        assert!(existing.join("marker.txt").exists());
+        assert!(starter_zip.captured.is_empty());
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_interactive_aborts_with_error_when_user_declines_overwrite() -> anyhow::Result<()>
+    {
+        let (paths, root) = temp_paths_with_root("init-overwrite-decline-interactive");
+        let output_dir = root.join("projects");
+        let existing = output_dir.join("demo");
+        fs::create_dir_all(&existing)?;
+        fs::write(existing.join("marker.txt"), b"keep")?;
+
+        let cli = Cli::parse_from([
+            "spg",
+            "init",
+            "demo",
+            "--group-id",
+            "com.example",
+            "--artifact-id",
+            "demo",
+            "--description",
+            "demo",
+            "--package-name",
+            "com.example.demo",
+            "--type",
+            "maven-project",
+            "--language",
+            "java",
+            "--boot-version",
+            "3.5.0",
+            "--java-version",
+            "17",
+            "--packaging",
+            "jar",
+            "--dependency",
+            "web",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let mut confirmation = StaticConfirmation::no();
         let mut prompter = UnusedPrompter;
         let mut metadata = StaticMetadataProvider {
@@ -1077,7 +1151,7 @@ mod tests {
             captured: Vec::new(),
         };
 
-        run_with_services(
+        let error = run_with_services(
             cli,
             &paths,
             &mut stdout,
@@ -1087,11 +1161,13 @@ mod tests {
             &mut metadata,
             &mut starter_zip,
         )
-        .await?;
+        .await
+        .expect_err("declined overwrite must propagate as an error");
 
+        let message = error.to_string();
+        assert!(message.contains("aborted"), "got: {message}");
         assert!(existing.join("marker.txt").exists());
         assert!(starter_zip.captured.is_empty());
-        assert!(String::from_utf8(stdout)?.contains("Aborted"));
 
         cleanup(&paths);
         Ok(())
