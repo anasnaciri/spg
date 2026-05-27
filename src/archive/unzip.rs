@@ -53,6 +53,20 @@ where
         })?;
         io::copy(&mut file, &mut output)
             .with_context(|| format!("failed to extract zip entry to {}", output_path.display()))?;
+
+        #[cfg(unix)]
+        if let Some(mode) = file.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&output_path, fs::Permissions::from_mode(mode)).with_context(
+                || {
+                    format!(
+                        "failed to set permissions on extracted zip entry at {}",
+                        output_path.display()
+                    )
+                },
+            )?;
+        }
     }
 
     Ok(())
@@ -122,6 +136,30 @@ mod tests {
         assert!(error.to_string().contains("unsafe zip entry path"));
         assert!(!destination.join("evil.txt").exists());
         assert!(!destination.parent().unwrap().join("evil.txt").exists());
+
+        let _ = fs::remove_dir_all(destination);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_unix_file_permissions_from_zip_metadata() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let destination = temp_dir("extract-permissions");
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().unix_permissions(0o755);
+        writer.start_file("demo/mvnw", options)?;
+        writer.write_all(b"#!/bin/sh\n")?;
+        let zip = writer.finish()?.into_inner();
+
+        extract_zip_archive(Cursor::new(zip), &destination)?;
+
+        let mode = fs::metadata(destination.join("demo").join("mvnw"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
 
         let _ = fs::remove_dir_all(destination);
         Ok(())
