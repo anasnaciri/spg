@@ -1317,10 +1317,18 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect(),
-            select_responses: ["maven-project", "java", "3.5.0", "17", "jar", "web"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            select_responses: [
+                "maven-project",
+                "java",
+                "3.5.0",
+                "17",
+                "jar",
+                "web",
+                "Done selecting dependencies",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
             ..ScriptedPrompter::default()
         };
         let mut metadata = StaticMetadataProvider {
@@ -1359,6 +1367,7 @@ mod tests {
                 "Spring Boot version?",
                 "Java version?",
                 "Packaging?",
+                "Add which dependency?",
                 "Add which dependency?",
             ]
         );

@@ -5,6 +5,8 @@ use crate::{
 use anyhow::Result;
 use std::collections::HashMap;
 
+const FINISH_DEPENDENCY_SELECTION_ID: &str = "Done selecting dependencies";
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DependencySelection {
     entries: Vec<DependencyEntry>,
@@ -95,26 +97,35 @@ pub fn pick_dependencies_interactively(
     let mut last_no_match: Option<String> = None;
     loop {
         let prompt = format!(
-            "Search dependencies (blank to finish; {})",
+            "Search dependencies (blank to browse all; {})",
             render_picker_status(&selection, last_no_match.as_deref())
         );
         let query = prompter.text(&prompt, Some(""))?;
         let trimmed = query.trim();
-        if trimmed.is_empty() {
-            break;
-        }
 
-        let matches = search_dependencies(metadata, trimmed);
+        let browsing_all = trimmed.is_empty();
+        let matches = if browsing_all {
+            entries.clone()
+        } else {
+            search_dependencies(metadata, trimmed)
+        };
         if matches.is_empty() {
             last_no_match = Some(trimmed.to_string());
             continue;
         }
         last_no_match = None;
 
-        let options: Vec<SelectOption> = matches.iter().map(dependency_option).collect();
-        let default_id = dependency_select_default(&matches, &selection);
+        let options = dependency_options(&matches, browsing_all);
+        let default_id = if browsing_all {
+            dependency_browse_default(&matches, &selection)
+        } else {
+            dependency_select_default(&matches, &selection)
+        };
         let chosen_id =
             prompter.select("Add which dependency?", &options, default_id.as_deref())?;
+        if chosen_id == FINISH_DEPENDENCY_SELECTION_ID {
+            break;
+        }
         if let Some(entry) = by_id.get(&chosen_id) {
             selection.add(entry.clone());
         }
@@ -134,6 +145,17 @@ fn dependency_select_default(
         .map(|entry| entry.id.clone())
 }
 
+fn dependency_browse_default(
+    matches: &[DependencyEntry],
+    selection: &DependencySelection,
+) -> Option<String> {
+    matches
+        .iter()
+        .find(|entry| !selection.contains(&entry.id))
+        .map(|entry| entry.id.clone())
+        .or_else(|| Some(FINISH_DEPENDENCY_SELECTION_ID.to_string()))
+}
+
 fn render_picker_status(selection: &DependencySelection, last_no_match: Option<&str>) -> String {
     let selected = if selection.entries().is_empty() {
         "no dependencies selected".to_string()
@@ -144,6 +166,20 @@ fn render_picker_status(selection: &DependencySelection, last_no_match: Option<&
         Some(query) => format!("no matches for '{query}'; {selected}"),
         None => selected,
     }
+}
+
+fn dependency_options(entries: &[DependencyEntry], include_finish: bool) -> Vec<SelectOption> {
+    let mut options: Vec<SelectOption> = entries.iter().map(dependency_option).collect();
+    if include_finish {
+        options.insert(
+            0,
+            SelectOption {
+                id: FINISH_DEPENDENCY_SELECTION_ID.to_string(),
+                name: FINISH_DEPENDENCY_SELECTION_ID.to_string(),
+            },
+        );
+    }
+    options
 }
 
 fn dependency_option(entry: &DependencyEntry) -> SelectOption {
@@ -258,11 +294,14 @@ mod tests {
     }
 
     #[test]
-    fn dependency_picker_loops_until_user_enters_blank_query() -> anyhow::Result<()> {
+    fn dependency_picker_loops_until_user_selects_done_from_browse_list() -> anyhow::Result<()> {
         let metadata = sample_metadata();
         let mut prompter = ScriptedPrompter {
             text_responses: ["web", "jpa", ""].into_iter().map(String::from).collect(),
-            select_responses: ["web", "data-jpa"].into_iter().map(String::from).collect(),
+            select_responses: ["web", "data-jpa", FINISH_DEPENDENCY_SELECTION_ID]
+                .into_iter()
+                .map(String::from)
+                .collect(),
             ..ScriptedPrompter::default()
         };
 
@@ -281,7 +320,10 @@ mod tests {
         let metadata = sample_metadata();
         let mut prompter = ScriptedPrompter {
             text_responses: ["spring", ""].into_iter().map(String::from).collect(),
-            select_responses: ["data-jpa"].into_iter().map(String::from).collect(),
+            select_responses: ["data-jpa", FINISH_DEPENDENCY_SELECTION_ID]
+                .into_iter()
+                .map(String::from)
+                .collect(),
             ..ScriptedPrompter::default()
         };
 
@@ -298,10 +340,43 @@ mod tests {
     }
 
     #[test]
+    fn dependency_picker_can_browse_all_dependencies_from_blank_search() -> anyhow::Result<()> {
+        let metadata = sample_metadata();
+        let mut prompter = ScriptedPrompter {
+            text_responses: ["", ""].into_iter().map(String::from).collect(),
+            select_responses: ["data-jpa", FINISH_DEPENDENCY_SELECTION_ID]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ..ScriptedPrompter::default()
+        };
+
+        let selected = pick_dependencies_interactively(&metadata, &[], &mut prompter)?;
+
+        assert_eq!(selected, ["data-jpa"]);
+        assert_eq!(
+            prompter.select_option_ids[0],
+            [
+                FINISH_DEPENDENCY_SELECTION_ID,
+                "web",
+                "data-jpa",
+                "devtools"
+            ]
+        );
+        assert_eq!(prompter.select_defaults[0], Some("web".to_string()));
+        assert_eq!(prompter.select_defaults[1], Some("web".to_string()));
+        Ok(())
+    }
+
+    #[test]
     fn dependency_picker_seeds_from_saved_config_and_drops_unknown_ids() -> anyhow::Result<()> {
         let metadata = sample_metadata();
         let mut prompter = ScriptedPrompter {
             text_responses: [""].into_iter().map(String::from).collect(),
+            select_responses: [FINISH_DEPENDENCY_SELECTION_ID]
+                .into_iter()
+                .map(String::from)
+                .collect(),
             ..ScriptedPrompter::default()
         };
 
@@ -325,7 +400,10 @@ mod tests {
                 .into_iter()
                 .map(String::from)
                 .collect(),
-            select_responses: ["web", "web"].into_iter().map(String::from).collect(),
+            select_responses: ["web", "web", FINISH_DEPENDENCY_SELECTION_ID]
+                .into_iter()
+                .map(String::from)
+                .collect(),
             ..ScriptedPrompter::default()
         };
 
