@@ -4,6 +4,7 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
+    style::Stylize,
     terminal::{self, Clear, ClearType},
 };
 use inquire::{Confirm, Text};
@@ -391,12 +392,8 @@ fn prompt_select(message: &str, labels: Vec<String>, starting_cursor: usize) -> 
             SelectPromptOutcome::Continue => {}
             SelectPromptOutcome::Selected(index) => {
                 clear_prompt(&mut stdout, rendered_lines)?;
-                write!(
-                    stdout,
-                    "> {} {}\r\n",
-                    message,
-                    state.cursor_label().unwrap_or_default()
-                )?;
+                let answer = state.cursor_label().unwrap_or_default();
+                write!(stdout, "{}\r\n", completed_prompt_line(message, answer))?;
                 stdout.flush()?;
                 return Ok(index);
             }
@@ -432,7 +429,7 @@ fn prompt_multi_select(
                 } else {
                     ids.join(", ")
                 };
-                write!(stdout, "> {message} {answer}\r\n")?;
+                write!(stdout, "{}\r\n", completed_prompt_line(message, &answer))?;
                 stdout.flush()?;
                 return Ok(ids);
             }
@@ -446,16 +443,16 @@ fn render_select_prompt(
     message: &str,
     state: &SelectPromptState,
 ) -> Result<usize> {
-    let mut lines = vec![format!("? {message}")];
+    let mut lines = vec![question_line(message)];
 
     let options = select_visible_options(state);
     if options.is_empty() {
-        lines.push("  No matches".to_string());
+        lines.push(warning_line("  No matches"));
     } else {
         lines.extend(options);
     }
 
-    lines.push("  Use arrows or j/k to move. Enter to select.".to_string());
+    lines.push(help_line("  Use arrows or j/k to move. Enter to select."));
     render_lines(stdout, rendered_lines, &lines)?;
     Ok(lines.len())
 }
@@ -464,7 +461,12 @@ fn select_visible_options(state: &SelectPromptState) -> Vec<String> {
     visible_positions(state.labels.len(), state.cursor, 10)
         .map(|position| {
             let prefix = if position == state.cursor { ">" } else { " " };
-            format!("{prefix} {}", state.labels[position])
+            let line = format!("{prefix} {}", state.labels[position]);
+            if position == state.cursor {
+                active_line(line)
+            } else {
+                muted_line(line)
+            }
         })
         .collect()
 }
@@ -486,9 +488,15 @@ fn render_multi_select_prompt(
         MultiSelectFocus::List => "list",
     };
     let mut lines = vec![
-        format!("? {message}"),
-        format!("  search: {} ({focus})", state.query()),
-        format!("  selected: {selected_label}"),
+        question_line(message),
+        focus_line(
+            format!("  search: {} ({focus})", state.query()),
+            state.focus() == MultiSelectFocus::Search,
+        ),
+        selected_line(
+            format!("  selected: {selected_label}"),
+            !selected.is_empty(),
+        ),
     ];
 
     let rendered_options = state.rendered_options();
@@ -499,22 +507,72 @@ fn render_multi_select_prompt(
             } else {
                 " "
             };
-            format!("{prefix} {}", rendered_options[position])
+            let line = format!("{prefix} {}", rendered_options[position]);
+            if state.focus() == MultiSelectFocus::List && position == state.cursor {
+                active_line(line)
+            } else if rendered_options[position].starts_with('■') {
+                success_line(line)
+            } else {
+                muted_line(line)
+            }
         })
         .collect::<Vec<_>>();
 
     if options.is_empty() {
-        lines.push("  No matches".to_string());
+        lines.push(warning_line("  No matches"));
     } else {
         lines.extend(options);
     }
 
-    lines.push(
-        "  Type to filter. Tab focuses list. Space toggles. Enter saves. Esc returns to search."
-            .to_string(),
-    );
+    lines.push(help_line(
+        "  Type to filter. Tab focuses list. Space toggles. Enter saves. Esc returns to search.",
+    ));
     render_lines(stdout, rendered_lines, &lines)?;
     Ok(lines.len())
+}
+
+fn question_line(message: &str) -> String {
+    active_line(format!("? {message}"))
+}
+
+fn completed_prompt_line(message: &str, answer: &str) -> String {
+    success_line(format!("> {message} {answer}"))
+}
+
+fn focus_line(line: String, focused: bool) -> String {
+    if focused {
+        active_line(line)
+    } else {
+        muted_line(line)
+    }
+}
+
+fn selected_line(line: String, has_selection: bool) -> String {
+    if has_selection {
+        success_line(line)
+    } else {
+        muted_line(line)
+    }
+}
+
+fn active_line(line: impl Into<String>) -> String {
+    format!("{}", line.into().cyan().bold())
+}
+
+fn success_line(line: impl Into<String>) -> String {
+    format!("{}", line.into().green().bold())
+}
+
+fn warning_line(line: impl Into<String>) -> String {
+    format!("{}", line.into().yellow())
+}
+
+fn help_line(line: impl Into<String>) -> String {
+    muted_line(line)
+}
+
+fn muted_line(line: impl Into<String>) -> String {
+    format!("{}", line.into().dark_grey())
 }
 
 fn visible_positions(len: usize, cursor: usize, page_size: usize) -> std::ops::Range<usize> {
@@ -676,6 +734,49 @@ mod tests {
         assert!(!output.contains("filter:"));
         assert!(output.contains("> Maven"));
         assert!(output.contains("Use arrows or j/k to move. Enter to select."));
+        Ok(())
+    }
+
+    #[test]
+    fn select_prompt_rendering_uses_ansi_visual_hierarchy() -> anyhow::Result<()> {
+        let state = SelectPromptState::new(vec!["Maven".to_string(), "Gradle".to_string()], 0);
+        let mut output = Vec::new();
+
+        render_select_prompt(&mut output, 0, "Project type?", &state)?;
+
+        let output = String::from_utf8(output)?;
+        assert!(
+            output.contains("\u{1b}["),
+            "select prompts should use ANSI styling for visual hierarchy; got: {output:?}"
+        );
+        assert!(output.contains("? Project type?"));
+        assert!(output.contains("> Maven"));
+        assert!(output.contains("  Gradle"));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_select_prompt_rendering_uses_ansi_visual_hierarchy() -> anyhow::Result<()> {
+        let ids = vec!["web".to_string(), "data-jpa".to_string()];
+        let labels = vec![
+            "Spring Web [Web]".to_string(),
+            "Spring Data JPA [SQL]".to_string(),
+        ];
+        let mut state = MultiSelectPromptState::new(ids, labels, &["web".to_string()]);
+        state.apply_key(PromptKey::Tab);
+        let mut output = Vec::new();
+
+        render_multi_select_prompt(&mut output, 0, "Select dependencies", &state)?;
+
+        let output = String::from_utf8(output)?;
+        assert!(
+            output.contains("\u{1b}["),
+            "multi-select prompts should use ANSI styling for visual hierarchy; got: {output:?}"
+        );
+        assert!(output.contains("? Select dependencies"));
+        assert!(output.contains("> ■ Spring Web [Web]"));
+        assert!(output.contains("  □ Spring Data JPA [SQL]"));
+        assert!(output.contains("Type to filter."));
         Ok(())
     }
 
