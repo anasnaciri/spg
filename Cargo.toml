@@ -1,7 +1,31 @@
 [package]
-name = "spg"
+name = "spg-cli"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["Anas Naciri <12anas2000@gmail.com>"]
+description = "A CLI for initializing Spring Boot Projects"
+readme = "README.md"
+homepage = "https://github.com/anasnaciri/spg"
+repository = "https://github.com/anasnaciri/spg"
+license = "MIT OR Apache-2.0"
+keywords = ["spring", "spring-boot", "initializr", "scaffold", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    "/.githooks",
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    "/Prompt.md",
+    "/todo.md",
+    "/init",
+]
+
+[lib]
+name = "spg"
+
+[[bin]]
+name = "spg"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
