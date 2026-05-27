@@ -1,9 +1,11 @@
 use crate::{
     archive::unzip::extract_zip_archive,
     cli::{CacheCommand, Cli, Commands, ConfigCommand, InitArgs},
-    config::{cache, paths::AppPaths, user_config},
+    config::{cache, paths::AppPaths, user_config, user_config::UserConfig},
     initializr::{
-        client::InitializrClient, generate::GenerationParams, metadata::InitializrMetadata,
+        client::InitializrClient,
+        generate::GenerationParams,
+        metadata::{InitializrMetadata, SelectOption},
     },
     prompts::{
         dependencies,
@@ -11,7 +13,7 @@ use crate::{
         ui::{InquirePrompter, Prompter},
     },
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use inquire::Confirm;
 use std::{
     fs,
@@ -209,6 +211,13 @@ pub async fn run_with_services(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavedConfigStrategy {
+    Reuse,
+    Edit,
+    Fresh,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_init(
     args: InitArgs,
@@ -223,13 +232,9 @@ async fn run_init(
         cache::clear_metadata_cache(&paths.metadata_cache_file)?;
     }
 
-    let config = user_config::load(&paths.user_config_file)?;
+    let saved_config = user_config::load(&paths.user_config_file)?;
     let metadata = metadata_provider.fetch_metadata().await?;
-    let plan = if args.defaults {
-        ProjectPlan::from_defaults(&args, config.as_ref(), &metadata)?
-    } else {
-        ProjectPlan::from_prompts(&args, config.as_ref(), &metadata, prompter)?
-    };
+    let (plan, offer_save) = build_plan(&args, saved_config.as_ref(), &metadata, prompter)?;
     plan.generation.validate(&metadata)?;
 
     prepare_output_dir(&plan.output_dir)?;
@@ -255,7 +260,78 @@ async fn run_init(
     extract_zip_archive(Cursor::new(archive), &plan.output_dir)?;
 
     print_success(stdout, &plan, &project_dir)?;
+
+    if offer_save && confirmation.confirm("Save these choices as your spg defaults?")? {
+        let new_config = plan.to_user_config();
+        user_config::save(&paths.user_config_file, &new_config)?;
+        writeln!(
+            stdout,
+            "Saved spg defaults to {}",
+            paths.user_config_file.display()
+        )?;
+    }
+
     Ok(())
+}
+
+fn build_plan(
+    args: &InitArgs,
+    saved_config: Option<&UserConfig>,
+    metadata: &InitializrMetadata,
+    prompter: &mut impl Prompter,
+) -> Result<(ProjectPlan, bool)> {
+    if args.defaults {
+        let plan = ProjectPlan::from_defaults(args, saved_config, metadata)?;
+        return Ok((plan, false));
+    }
+
+    if let Some(config) = saved_config {
+        match prompt_for_saved_config_strategy(prompter)? {
+            SavedConfigStrategy::Reuse => {
+                let plan = ProjectPlan::from_defaults(args, Some(config), metadata)?;
+                Ok((plan, false))
+            }
+            SavedConfigStrategy::Edit => {
+                let plan = ProjectPlan::from_prompts(args, Some(config), metadata, prompter)?;
+                Ok((plan, true))
+            }
+            SavedConfigStrategy::Fresh => {
+                let plan = ProjectPlan::from_prompts(args, None, metadata, prompter)?;
+                Ok((plan, true))
+            }
+        }
+    } else {
+        let plan = ProjectPlan::from_prompts(args, None, metadata, prompter)?;
+        Ok((plan, true))
+    }
+}
+
+fn prompt_for_saved_config_strategy(prompter: &mut impl Prompter) -> Result<SavedConfigStrategy> {
+    let options = [
+        SelectOption {
+            id: "edit".to_string(),
+            name: "Edit saved defaults".to_string(),
+        },
+        SelectOption {
+            id: "reuse".to_string(),
+            name: "Use saved defaults as-is".to_string(),
+        },
+        SelectOption {
+            id: "fresh".to_string(),
+            name: "Start fresh (ignore saved defaults)".to_string(),
+        },
+    ];
+    let selected = prompter.select(
+        "Found saved spg defaults. How would you like to proceed?",
+        &options,
+        Some("edit"),
+    )?;
+    match selected.as_str() {
+        "reuse" => Ok(SavedConfigStrategy::Reuse),
+        "edit" => Ok(SavedConfigStrategy::Edit),
+        "fresh" => Ok(SavedConfigStrategy::Fresh),
+        other => bail!("unexpected saved config strategy '{other}'"),
+    }
 }
 
 fn prepare_output_dir(output_dir: &Path) -> Result<()> {
@@ -1152,7 +1228,7 @@ mod tests {
         ]);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let mut confirmation = StaticConfirmation::default();
+        let mut confirmation = StaticConfirmation::no();
         let mut prompter = ScriptedPrompter {
             text_responses: [
                 "com.acme",
@@ -1220,6 +1296,218 @@ mod tests {
         assert_eq!(params.java_version, "17");
         assert_eq!(params.packaging, "jar");
         assert_eq!(params.dependencies, ["web"]);
+        assert!(
+            !paths.user_config_file.exists(),
+            "save prompt was declined; no config should be written"
+        );
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_interactive_saves_defaults_when_user_confirms() -> anyhow::Result<()> {
+        let (paths, root) = temp_paths_with_root("init-save-defaults");
+        let output_dir = root.join("projects");
+
+        let cli = Cli::parse_from([
+            "spg",
+            "init",
+            "saved-demo",
+            "--group-id",
+            "com.acme",
+            "--artifact-id",
+            "saved-demo",
+            "--description",
+            "Saved demo",
+            "--package-name",
+            "com.acme.demo",
+            "--type",
+            "gradle-project",
+            "--language",
+            "java",
+            "--boot-version",
+            "3.5.0",
+            "--java-version",
+            "21",
+            "--packaging",
+            "jar",
+            "--dependency",
+            "web",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::yes();
+        let mut prompter = UnusedPrompter;
+        let mut metadata = StaticMetadataProvider {
+            metadata: full_sample_metadata()?,
+        };
+        let mut starter_zip = StaticStarterZipProvider {
+            bytes: make_demo_zip("saved-demo")?,
+            captured: Vec::new(),
+        };
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut prompter,
+            &mut metadata,
+            &mut starter_zip,
+        )
+        .await?;
+
+        assert!(paths.user_config_file.exists());
+        let saved = user_config::load(&paths.user_config_file)?.expect("config saved");
+        assert_eq!(saved.group_id.as_deref(), Some("com.acme"));
+        assert_eq!(saved.build.as_deref(), Some("gradle"));
+        assert_eq!(saved.java_version.as_deref(), Some("21"));
+        assert_eq!(saved.dependencies, ["web"]);
+        assert!(
+            String::from_utf8(stdout)?.contains("Saved spg defaults"),
+            "success path should mention persisted defaults"
+        );
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_with_saved_config_reuse_strategy_skips_field_prompts() -> anyhow::Result<()> {
+        let (paths, root) = temp_paths_with_root("init-reuse-saved");
+        let output_dir = root.join("projects");
+        user_config::save(
+            &paths.user_config_file,
+            &UserConfig {
+                group_id: Some("com.saved".to_string()),
+                build: Some("gradle".to_string()),
+                java_version: Some("21".to_string()),
+                dependencies: vec!["web".to_string()],
+                package_name_pattern: Some("{group_id}.{artifact_id}".to_string()),
+                ..UserConfig::default()
+            },
+        )?;
+
+        let cli = Cli::parse_from([
+            "spg",
+            "init",
+            "reuse-demo",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::default();
+        let mut prompter = ScriptedPrompter {
+            select_responses: ["reuse"].into_iter().map(String::from).collect(),
+            ..ScriptedPrompter::default()
+        };
+        let mut metadata = StaticMetadataProvider {
+            metadata: full_sample_metadata()?,
+        };
+        let mut starter_zip = StaticStarterZipProvider {
+            bytes: make_demo_zip("reuse-demo")?,
+            captured: Vec::new(),
+        };
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut prompter,
+            &mut metadata,
+            &mut starter_zip,
+        )
+        .await?;
+
+        assert_eq!(prompter.text_messages.len(), 0, "no field prompts");
+        assert_eq!(prompter.select_messages.len(), 1);
+        assert!(prompter.select_messages[0].contains("saved spg defaults"));
+        let params = &starter_zip.captured[0];
+        assert_eq!(params.group_id, "com.saved");
+        assert_eq!(params.project_type, "gradle-project");
+        assert_eq!(params.java_version, "21");
+        assert_eq!(params.dependencies, ["web"]);
+        assert_eq!(params.package_name, "com.saved.reuse_demo");
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_with_saved_config_fresh_strategy_ignores_saved_defaults() -> anyhow::Result<()> {
+        let (paths, root) = temp_paths_with_root("init-fresh-strategy");
+        let output_dir = root.join("projects");
+        user_config::save(
+            &paths.user_config_file,
+            &UserConfig {
+                group_id: Some("com.saved".to_string()),
+                build: Some("gradle".to_string()),
+                java_version: Some("21".to_string()),
+                dependencies: vec!["web".to_string()],
+                ..UserConfig::default()
+            },
+        )?;
+
+        let cli = Cli::parse_from([
+            "spg",
+            "init",
+            "fresh-demo",
+            "--artifact-id",
+            "fresh-demo",
+            "--description",
+            "Fresh",
+            "--package-name",
+            "com.example.fresh",
+            "--dependency",
+            "web",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::no();
+        let mut prompter = ScriptedPrompter {
+            text_responses: ["com.example"].into_iter().map(String::from).collect(),
+            select_responses: ["fresh", "maven-project", "java", "3.5.0", "17", "jar"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ..ScriptedPrompter::default()
+        };
+        let mut metadata = StaticMetadataProvider {
+            metadata: full_sample_metadata()?,
+        };
+        let mut starter_zip = StaticStarterZipProvider {
+            bytes: make_demo_zip("fresh-demo")?,
+            captured: Vec::new(),
+        };
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut prompter,
+            &mut metadata,
+            &mut starter_zip,
+        )
+        .await?;
+
+        let params = &starter_zip.captured[0];
+        assert_eq!(params.group_id, "com.example", "saved group id was ignored");
+        assert_eq!(
+            params.project_type, "maven-project",
+            "saved build (gradle) was ignored in favor of metadata default"
+        );
+        assert_eq!(params.java_version, "17", "saved Java 21 was ignored");
 
         cleanup(&paths);
         Ok(())

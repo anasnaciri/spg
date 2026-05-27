@@ -243,6 +243,27 @@ impl ProjectPlan {
             output_dir,
         })
     }
+
+    pub fn to_user_config(&self) -> UserConfig {
+        UserConfig {
+            group_id: Some(self.generation.group_id.clone()),
+            language: Some(self.generation.language.clone()),
+            build: Some(project_type_to_build(&self.generation.project_type)),
+            packaging: Some(self.generation.packaging.clone()),
+            java_version: Some(self.generation.java_version.clone()),
+            dependencies: self.generation.dependencies.clone(),
+            package_name_pattern: None,
+            output_dir: Some(self.output_dir.display().to_string()),
+        }
+    }
+}
+
+fn project_type_to_build(project_type: &str) -> String {
+    if project_type.contains("gradle") {
+        "gradle".to_string()
+    } else {
+        "maven".to_string()
+    }
 }
 
 fn build_to_project_type(build: &str) -> String {
@@ -619,6 +640,38 @@ mod tests {
             prompter.text_calls.is_empty(),
             "all text prompts should have been skipped"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn to_user_config_captures_generation_choices_for_persistence() -> anyhow::Result<()> {
+        let args = InitArgs {
+            project_name: Some("orders".to_string()),
+            artifact_id: Some("orders".to_string()),
+            group_id: Some("com.acme".to_string()),
+            package_name: Some("com.acme.orders".to_string()),
+            description: Some("Orders".to_string()),
+            project_type: Some("gradle-project".to_string()),
+            language: Some("kotlin".to_string()),
+            boot_version: Some("3.5.0".to_string()),
+            java_version: Some("21".to_string()),
+            packaging: Some("war".to_string()),
+            dependencies: vec!["web".to_string()],
+            output_dir: Some(PathBuf::from("projects")),
+            ..empty_init_args()
+        };
+        let plan = ProjectPlan::from_defaults(&args, None, &sample_metadata())?;
+
+        let config = plan.to_user_config();
+
+        assert_eq!(config.group_id.as_deref(), Some("com.acme"));
+        assert_eq!(config.language.as_deref(), Some("kotlin"));
+        assert_eq!(config.build.as_deref(), Some("gradle"));
+        assert_eq!(config.packaging.as_deref(), Some("war"));
+        assert_eq!(config.java_version.as_deref(), Some("21"));
+        assert_eq!(config.dependencies, ["web"]);
+        assert_eq!(config.output_dir.as_deref(), Some("projects"));
+        assert!(config.package_name_pattern.is_none());
         Ok(())
     }
 
