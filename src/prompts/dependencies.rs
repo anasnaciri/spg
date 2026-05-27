@@ -27,6 +27,10 @@ impl DependencySelection {
     pub fn entries(&self) -> &[DependencyEntry] {
         &self.entries
     }
+
+    fn contains(&self, id: &str) -> bool {
+        self.entries.iter().any(|entry| entry.id == id)
+    }
 }
 
 pub fn search_dependencies(
@@ -108,13 +112,26 @@ pub fn pick_dependencies_interactively(
         last_no_match = None;
 
         let options: Vec<SelectOption> = matches.iter().map(dependency_option).collect();
-        let chosen_id = prompter.select("Add which dependency?", &options, None)?;
+        let default_id = dependency_select_default(&matches, &selection);
+        let chosen_id =
+            prompter.select("Add which dependency?", &options, default_id.as_deref())?;
         if let Some(entry) = by_id.get(&chosen_id) {
             selection.add(entry.clone());
         }
     }
 
     Ok(selection.ids())
+}
+
+fn dependency_select_default(
+    matches: &[DependencyEntry],
+    selection: &DependencySelection,
+) -> Option<String> {
+    matches
+        .iter()
+        .find(|entry| !selection.contains(&entry.id))
+        .or_else(|| matches.first())
+        .map(|entry| entry.id.clone())
 }
 
 fn render_picker_status(selection: &DependencySelection, last_no_match: Option<&str>) -> String {
@@ -212,6 +229,7 @@ mod tests {
         text_prompts: Vec<String>,
         select_prompts: Vec<String>,
         select_option_ids: Vec<Vec<String>>,
+        select_defaults: Vec<Option<String>>,
     }
 
     impl Prompter for ScriptedPrompter {
@@ -226,11 +244,13 @@ mod tests {
             &mut self,
             message: &str,
             options: &[crate::initializr::metadata::SelectOption],
-            _default_id: Option<&str>,
+            default_id: Option<&str>,
         ) -> anyhow::Result<String> {
             self.select_prompts.push(message.to_string());
             self.select_option_ids
                 .push(options.iter().map(|option| option.id.clone()).collect());
+            self.select_defaults
+                .push(default_id.map(ToString::to_string));
             self.select_responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("no select response scripted for: {message}"))
@@ -253,6 +273,27 @@ mod tests {
         assert!(prompter.text_prompts[0].contains("no dependencies selected"));
         assert!(prompter.text_prompts[1].contains("selected: web"));
         assert_eq!(prompter.select_option_ids[1], ["data-jpa"]);
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_picker_defaults_select_cursor_to_first_unselected_match() -> anyhow::Result<()> {
+        let metadata = sample_metadata();
+        let mut prompter = ScriptedPrompter {
+            text_responses: ["spring", ""].into_iter().map(String::from).collect(),
+            select_responses: ["data-jpa"].into_iter().map(String::from).collect(),
+            ..ScriptedPrompter::default()
+        };
+
+        let selected =
+            pick_dependencies_interactively(&metadata, &["web".to_string()], &mut prompter)?;
+
+        assert_eq!(selected, ["web", "data-jpa"]);
+        assert_eq!(
+            prompter.select_option_ids[0],
+            ["web", "data-jpa", "devtools"]
+        );
+        assert_eq!(prompter.select_defaults[0], Some("data-jpa".to_string()));
         Ok(())
     }
 
