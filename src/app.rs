@@ -1,15 +1,19 @@
 use crate::{
-    cli::{CacheCommand, Cli, Commands, ConfigCommand},
+    archive::unzip::extract_zip_archive,
+    cli::{CacheCommand, Cli, Commands, ConfigCommand, InitArgs},
     config::{cache, paths::AppPaths, user_config},
-    initializr::{client::InitializrClient, metadata::InitializrMetadata},
-    prompts::dependencies,
+    initializr::{
+        client::InitializrClient, generate::GenerationParams, metadata::InitializrMetadata,
+    },
+    prompts::{dependencies, project::ProjectPlan},
 };
 use anyhow::{Context, Result};
 use inquire::Confirm;
 use std::{
+    fs,
     future::Future,
-    io::{self, Write},
-    path::PathBuf,
+    io::{self, Cursor, Write},
+    path::{Path, PathBuf},
     pin::Pin,
     time::SystemTime,
 };
@@ -22,6 +26,13 @@ pub trait MetadataProvider {
     fn fetch_metadata<'a>(
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<InitializrMetadata>> + 'a>>;
+}
+
+pub trait StarterZipProvider {
+    fn download_starter_zip<'a>(
+        &'a mut self,
+        params: &'a GenerationParams,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + 'a>>;
 }
 
 pub struct InquireConfirmation;
@@ -76,6 +87,15 @@ impl MetadataProvider for InitializrClient {
     }
 }
 
+impl StarterZipProvider for InitializrClient {
+    fn download_starter_zip<'a>(
+        &'a mut self,
+        params: &'a GenerationParams,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + 'a>> {
+        Box::pin(async move { InitializrClient::download_starter_zip(self, params).await })
+    }
+}
+
 impl<P> MetadataProvider for CachedMetadataProvider<'_, P>
 where
     P: MetadataProvider,
@@ -115,9 +135,10 @@ pub async fn run_with_paths(
     stderr: &mut impl Write,
     confirmation: &mut impl Confirmation,
 ) -> Result<()> {
-    let mut metadata_provider = InitializrClient::new_default()?;
+    let mut metadata_client = InitializrClient::new_default()?;
+    let mut starter_zip_client = metadata_client.clone();
     let mut metadata_provider =
-        CachedMetadataProvider::new(paths.metadata_cache_file.clone(), &mut metadata_provider);
+        CachedMetadataProvider::new(paths.metadata_cache_file.clone(), &mut metadata_client);
     run_with_services(
         cli,
         paths,
@@ -125,6 +146,7 @@ pub async fn run_with_paths(
         stderr,
         confirmation,
         &mut metadata_provider,
+        &mut starter_zip_client,
     )
     .await
 }
@@ -136,11 +158,19 @@ pub async fn run_with_services(
     stderr: &mut impl Write,
     confirmation: &mut impl Confirmation,
     metadata_provider: &mut impl MetadataProvider,
+    starter_zip_provider: &mut impl StarterZipProvider,
 ) -> Result<()> {
     match cli.command {
         Commands::Init(args) => {
-            let name = args.project_name.as_deref().unwrap_or("<prompt>");
-            writeln!(stderr, "spg init is not implemented yet for {name}")?;
+            run_init(
+                *args,
+                paths,
+                stdout,
+                confirmation,
+                metadata_provider,
+                starter_zip_provider,
+            )
+            .await?;
         }
         Commands::Deps(args) => {
             let metadata = metadata_provider.fetch_metadata().await?;
@@ -157,6 +187,87 @@ pub async fn run_with_services(
         }
     }
 
+    let _ = stderr;
+    Ok(())
+}
+
+async fn run_init(
+    args: InitArgs,
+    paths: &AppPaths,
+    stdout: &mut impl Write,
+    confirmation: &mut impl Confirmation,
+    metadata_provider: &mut impl MetadataProvider,
+    starter_zip_provider: &mut impl StarterZipProvider,
+) -> Result<()> {
+    if args.refresh {
+        cache::clear_metadata_cache(&paths.metadata_cache_file)?;
+    }
+
+    let config = user_config::load(&paths.user_config_file)?;
+    let metadata = metadata_provider.fetch_metadata().await?;
+    let plan = ProjectPlan::from_defaults(&args, config.as_ref(), &metadata)?;
+    plan.generation.validate(&metadata)?;
+
+    prepare_output_dir(&plan.output_dir)?;
+
+    let project_dir = plan.output_dir.join(&plan.generation.base_dir);
+    if project_dir.exists()
+        && !confirmation.confirm(&format!(
+            "{} already exists. Overwrite?",
+            project_dir.display()
+        ))?
+    {
+        writeln!(
+            stdout,
+            "Aborted: kept existing project at {}",
+            project_dir.display()
+        )?;
+        return Ok(());
+    }
+
+    let archive = starter_zip_provider
+        .download_starter_zip(&plan.generation)
+        .await?;
+    extract_zip_archive(Cursor::new(archive), &plan.output_dir)?;
+
+    print_success(stdout, &plan, &project_dir)?;
+    Ok(())
+}
+
+fn prepare_output_dir(output_dir: &Path) -> Result<()> {
+    fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "failed to create output directory at {}",
+            output_dir.display()
+        )
+    })?;
+
+    let probe = output_dir.join(".spg-write-check");
+    fs::write(&probe, b"").with_context(|| {
+        format!(
+            "output directory is not writable at {}",
+            output_dir.display()
+        )
+    })?;
+    let _ = fs::remove_file(&probe);
+    Ok(())
+}
+
+fn print_success(stdout: &mut impl Write, plan: &ProjectPlan, project_dir: &Path) -> Result<()> {
+    writeln!(
+        stdout,
+        "Created Spring Boot project at {}",
+        project_dir.display()
+    )?;
+    writeln!(stdout)?;
+    writeln!(stdout, "Next steps:")?;
+    writeln!(stdout, "  cd {}", plan.generation.base_dir)?;
+    let project_type = plan.generation.project_type.as_str();
+    if project_type.contains("gradle") {
+        writeln!(stdout, "  ./gradlew bootRun")?;
+    } else if project_type.contains("maven") {
+        writeln!(stdout, "  ./mvnw spring-boot:run")?;
+    }
     Ok(())
 }
 
@@ -251,10 +362,12 @@ mod tests {
     use std::{
         fs,
         future::Future,
+        io::Cursor,
         path::{Path, PathBuf},
         pin::Pin,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
+    use zip::{ZipWriter, write::SimpleFileOptions};
 
     #[derive(Default)]
     struct StaticConfirmation {
@@ -306,6 +419,37 @@ mod tests {
             self.calls += 1;
             let metadata = self.metadata.clone();
             Box::pin(async move { Ok(metadata) })
+        }
+    }
+
+    struct UnusedStarterZipProvider;
+
+    impl StarterZipProvider for UnusedStarterZipProvider {
+        fn download_starter_zip<'a>(
+            &'a mut self,
+            _params: &'a GenerationParams,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + 'a>> {
+            Box::pin(async move {
+                Err(anyhow::anyhow!(
+                    "StarterZipProvider should not be called in this test"
+                ))
+            })
+        }
+    }
+
+    struct StaticStarterZipProvider {
+        bytes: Vec<u8>,
+        captured: Vec<GenerationParams>,
+    }
+
+    impl StarterZipProvider for StaticStarterZipProvider {
+        fn download_starter_zip<'a>(
+            &'a mut self,
+            params: &'a GenerationParams,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<u8>>> + 'a>> {
+            self.captured.push(params.clone());
+            let bytes = self.bytes.clone();
+            Box::pin(async move { Ok(bytes) })
         }
     }
 
@@ -441,6 +585,7 @@ mod tests {
         let mut metadata = StaticMetadataProvider {
             metadata: sample_metadata()?,
         };
+        let mut starter_zip = UnusedStarterZipProvider;
 
         run_with_services(
             cli,
@@ -449,6 +594,7 @@ mod tests {
             &mut stderr,
             &mut confirmation,
             &mut metadata,
+            &mut starter_zip,
         )
         .await?;
 
@@ -471,6 +617,7 @@ mod tests {
         let mut metadata = StaticMetadataProvider {
             metadata: sample_metadata()?,
         };
+        let mut starter_zip = UnusedStarterZipProvider;
 
         run_with_services(
             cli,
@@ -479,6 +626,7 @@ mod tests {
             &mut stderr,
             &mut confirmation,
             &mut metadata,
+            &mut starter_zip,
         )
         .await?;
 
@@ -514,6 +662,7 @@ mod tests {
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_100),
             std::time::Duration::from_secs(24 * 60 * 60),
         );
+        let mut starter_zip = UnusedStarterZipProvider;
 
         run_with_services(
             cli,
@@ -522,6 +671,7 @@ mod tests {
             &mut stderr,
             &mut confirmation,
             &mut cached,
+            &mut starter_zip,
         )
         .await?;
 
@@ -552,6 +702,7 @@ mod tests {
             now,
             std::time::Duration::from_secs(24 * 60 * 60),
         );
+        let mut starter_zip = UnusedStarterZipProvider;
 
         run_with_services(
             cli,
@@ -560,6 +711,7 @@ mod tests {
             &mut stderr,
             &mut confirmation,
             &mut cached,
+            &mut starter_zip,
         )
         .await?;
 
@@ -579,6 +731,346 @@ mod tests {
 
         cleanup(&paths);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_with_defaults_extracts_starter_archive_and_prints_next_steps()
+    -> anyhow::Result<()> {
+        let (paths, root) = temp_paths_with_root("init-defaults");
+        let output_dir = root.join("projects");
+
+        let cli = Cli::parse_from([
+            "spg",
+            "init",
+            "orders-api",
+            "--defaults",
+            "--group-id",
+            "com.acme",
+            "--package-name",
+            "com.acme.orders",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::default();
+        let mut metadata = StaticMetadataProvider {
+            metadata: full_sample_metadata()?,
+        };
+        let mut starter_zip = StaticStarterZipProvider {
+            bytes: make_demo_zip("orders-api")?,
+            captured: Vec::new(),
+        };
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut metadata,
+            &mut starter_zip,
+        )
+        .await?;
+
+        let project_dir = output_dir.join("orders-api");
+        assert!(project_dir.join("pom.xml").exists());
+        assert_eq!(starter_zip.captured.len(), 1);
+        let params = &starter_zip.captured[0];
+        assert_eq!(params.base_dir, "orders-api");
+        assert_eq!(params.artifact_id, "orders-api");
+        assert_eq!(params.group_id, "com.acme");
+        assert_eq!(params.package_name, "com.acme.orders");
+        assert_eq!(params.project_type, "maven-project");
+
+        let output = String::from_utf8(stdout)?;
+        assert!(output.contains(
+            format!("Created Spring Boot project at {}", project_dir.display()).as_str()
+        ));
+        assert!(output.contains("cd orders-api"));
+        assert!(output.contains("./mvnw spring-boot:run"));
+        assert!(stderr.is_empty());
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_with_gradle_build_prints_gradle_runner_hint() -> anyhow::Result<()> {
+        let (paths, root) = temp_paths_with_root("init-gradle-hint");
+        let output_dir = root.join("projects");
+
+        let cli = Cli::parse_from([
+            "spg",
+            "init",
+            "demo",
+            "--defaults",
+            "--build",
+            "gradle",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::default();
+        let mut metadata = StaticMetadataProvider {
+            metadata: full_sample_metadata()?,
+        };
+        let mut starter_zip = StaticStarterZipProvider {
+            bytes: make_demo_zip("demo")?,
+            captured: Vec::new(),
+        };
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut metadata,
+            &mut starter_zip,
+        )
+        .await?;
+
+        let output = String::from_utf8(stdout)?;
+        assert!(output.contains("./gradlew bootRun"));
+        assert!(!output.contains("./mvnw"));
+        assert_eq!(starter_zip.captured[0].project_type, "gradle-project");
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_aborts_when_user_declines_overwrite_of_existing_project_folder()
+    -> anyhow::Result<()> {
+        let (paths, root) = temp_paths_with_root("init-overwrite-declined");
+        let output_dir = root.join("projects");
+        let existing = output_dir.join("demo");
+        fs::create_dir_all(&existing)?;
+        fs::write(existing.join("marker.txt"), b"keep")?;
+
+        let cli = Cli::parse_from([
+            "spg",
+            "init",
+            "demo",
+            "--defaults",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::no();
+        let mut metadata = StaticMetadataProvider {
+            metadata: full_sample_metadata()?,
+        };
+        let mut starter_zip = StaticStarterZipProvider {
+            bytes: make_demo_zip("demo")?,
+            captured: Vec::new(),
+        };
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut metadata,
+            &mut starter_zip,
+        )
+        .await?;
+
+        assert!(existing.join("marker.txt").exists());
+        assert!(starter_zip.captured.is_empty());
+        assert!(String::from_utf8(stdout)?.contains("Aborted"));
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_with_refresh_clears_cached_metadata_before_fetching() -> anyhow::Result<()> {
+        let (paths, root) = temp_paths_with_root("init-refresh");
+        let output_dir = root.join("projects");
+        crate::config::cache::save_metadata_cache(
+            &paths.metadata_cache_file,
+            &full_sample_metadata()?,
+            UNIX_EPOCH + Duration::from_secs(1_000),
+        )?;
+
+        let cli = Cli::parse_from([
+            "spg",
+            "init",
+            "demo",
+            "--defaults",
+            "--refresh",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::default();
+        let mut upstream = CountingMetadataProvider {
+            metadata: full_sample_metadata()?,
+            calls: 0,
+        };
+        let mut cached = CachedMetadataProvider::with_settings(
+            paths.metadata_cache_file.clone(),
+            &mut upstream,
+            UNIX_EPOCH + Duration::from_secs(1_100),
+            Duration::from_secs(24 * 60 * 60),
+        );
+        let mut starter_zip = StaticStarterZipProvider {
+            bytes: make_demo_zip("demo")?,
+            captured: Vec::new(),
+        };
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut cached,
+            &mut starter_zip,
+        )
+        .await?;
+
+        drop(cached);
+        assert_eq!(upstream.calls, 1);
+        assert_eq!(starter_zip.captured.len(), 1);
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_loads_saved_user_config_for_missing_flags() -> anyhow::Result<()> {
+        let (paths, root) = temp_paths_with_root("init-uses-saved-config");
+        let output_dir = root.join("projects");
+        crate::config::user_config::save(
+            &paths.user_config_file,
+            &UserConfig {
+                group_id: Some("com.saved".to_string()),
+                build: Some("gradle".to_string()),
+                java_version: Some("21".to_string()),
+                dependencies: vec!["web".to_string()],
+                package_name_pattern: Some("{group_id}.{artifact_id}".to_string()),
+                ..UserConfig::default()
+            },
+        )?;
+
+        let cli = Cli::parse_from([
+            "spg",
+            "init",
+            "saved-demo",
+            "--defaults",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::default();
+        let mut metadata = StaticMetadataProvider {
+            metadata: full_sample_metadata()?,
+        };
+        let mut starter_zip = StaticStarterZipProvider {
+            bytes: make_demo_zip("saved-demo")?,
+            captured: Vec::new(),
+        };
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut metadata,
+            &mut starter_zip,
+        )
+        .await?;
+
+        let params = &starter_zip.captured[0];
+        assert_eq!(params.group_id, "com.saved");
+        assert_eq!(params.project_type, "gradle-project");
+        assert_eq!(params.java_version, "21");
+        assert_eq!(params.dependencies, ["web"]);
+        assert_eq!(params.package_name, "com.saved.saved_demo");
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    fn full_sample_metadata() -> serde_json::Result<InitializrMetadata> {
+        serde_json::from_str(
+            r#"
+            {
+              "type": {
+                "default": "maven-project",
+                "values": [
+                  { "id": "maven-project", "name": "Maven" },
+                  { "id": "gradle-project", "name": "Gradle" }
+                ]
+              },
+              "language": {
+                "default": "java",
+                "values": [
+                  { "id": "java", "name": "Java" },
+                  { "id": "kotlin", "name": "Kotlin" }
+                ]
+              },
+              "bootVersion": {
+                "default": "3.5.0",
+                "values": [
+                  { "id": "3.5.0", "name": "3.5.0" }
+                ]
+              },
+              "javaVersion": {
+                "default": "17",
+                "values": [
+                  { "id": "17", "name": "17" },
+                  { "id": "21", "name": "21" }
+                ]
+              },
+              "packaging": {
+                "default": "jar",
+                "values": [
+                  { "id": "jar", "name": "Jar" },
+                  { "id": "war", "name": "War" }
+                ]
+              },
+              "dependencies": {
+                "values": [
+                  {
+                    "name": "Web",
+                    "values": [
+                      { "id": "web", "name": "Spring Web" }
+                    ]
+                  }
+                ]
+              }
+            }
+            "#,
+        )
+    }
+
+    fn make_demo_zip(base_dir: &str) -> anyhow::Result<Vec<u8>> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default();
+        writer.add_directory(format!("{base_dir}/"), options)?;
+        writer.start_file(format!("{base_dir}/pom.xml"), options)?;
+        writer.write_all(b"<project />")?;
+        Ok(writer.finish()?.into_inner())
+    }
+
+    fn temp_paths_with_root(test_name: &str) -> (AppPaths, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("spg-{test_name}-{unique}"));
+        let paths = AppPaths::from_dirs(root.join("config"), root.join("cache"));
+        (paths, root)
     }
 
     fn sample_metadata() -> serde_json::Result<InitializrMetadata> {
