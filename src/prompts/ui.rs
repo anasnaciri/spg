@@ -43,8 +43,7 @@ impl Prompter for InquirePrompter {
             .and_then(|id| options.iter().position(|option| option.id == id))
             .unwrap_or(0);
 
-        let selection = Select::new(message, labels.clone())
-            .with_starting_cursor(starting_cursor)
+        let selection = configure_select(Select::new(message, labels.clone()), starting_cursor)
             .prompt()
             .with_context(|| format!("failed to read selection for prompt: {message}"))?;
 
@@ -65,9 +64,31 @@ fn format_option_label(option: &SelectOption) -> String {
     }
 }
 
+fn configure_select<T>(select: Select<'_, T>, starting_cursor: usize) -> Select<'_, T>
+where
+    T: std::fmt::Display,
+{
+    select
+        .with_starting_cursor(starting_cursor)
+        .with_vim_mode(true)
+        .with_help_message("↑/↓ or k/j to move, Enter to select, Esc to cancel")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configure_select_enables_vim_mode_and_applies_starting_cursor() {
+        let select = Select::new("?", vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        let configured = configure_select(select, 2);
+
+        assert!(
+            configured.vim_mode,
+            "vim_mode should be enabled so j/k navigate the list"
+        );
+        assert_eq!(configured.starting_cursor, 2);
+    }
 
     #[test]
     fn format_option_label_uses_id_when_name_is_missing_or_matches_id() {
