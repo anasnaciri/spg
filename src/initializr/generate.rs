@@ -67,7 +67,10 @@ impl GenerationParams {
         let dependencies = metadata.dependency_entries();
         for dependency in &self.dependencies {
             if !dependencies.iter().any(|entry| entry.id == *dependency) {
-                bail!("unsupported dependency '{dependency}'");
+                bail!(
+                    "unsupported dependency '{dependency}'. \
+                     Run `spg deps` to list available Spring Initializr dependencies."
+                );
             }
         }
 
@@ -77,9 +80,18 @@ impl GenerationParams {
 
 fn validate_metadata_value(label: &str, value: &str, field: &SelectField) -> Result<()> {
     if field.values.iter().any(|option| option.id == value) {
-        Ok(())
+        return Ok(());
+    }
+    let available = field
+        .values
+        .iter()
+        .map(|option| option.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if available.is_empty() {
+        bail!("unsupported {label} '{value}'");
     } else {
-        bail!("unsupported {label} '{value}'")
+        bail!("unsupported {label} '{value}'. Available: {available}");
     }
 }
 

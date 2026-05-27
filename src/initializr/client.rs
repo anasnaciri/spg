@@ -51,34 +51,50 @@ impl InitializrClient {
 
     pub async fn fetch_metadata(&self) -> Result<InitializrMetadata> {
         let request = self.metadata_request()?;
-        let response = self
-            .http
-            .execute(request)
-            .await
-            .context("failed to fetch Spring Initializr metadata")?;
+        let response = self.http.execute(request).await.map_err(|error| {
+            network_error(error, &self.base_url, "fetch Spring Initializr metadata")
+        })?;
         let status = response.status();
 
         if !status.is_success() {
-            bail!("Spring Initializr metadata request failed with HTTP {status}");
+            bail!(
+                "Spring Initializr metadata request to {} failed with HTTP {status}. \
+                 Try again later, or check that {} is reachable.",
+                self.base_url,
+                self.base_url
+            );
         }
 
         response
             .json::<InitializrMetadata>()
             .await
-            .context("failed to parse Spring Initializr metadata")
+            .with_context(|| {
+                format!(
+                    "failed to parse Spring Initializr metadata from {}. \
+                 The service may be returning an unexpected format; \
+                 try `spg cache clear` and retry.",
+                    self.base_url
+                )
+            })
     }
 
     pub async fn download_starter_zip(&self, params: &GenerationParams) -> Result<Vec<u8>> {
         let request = self.starter_zip_request(params)?;
-        let response = self
-            .http
-            .execute(request)
-            .await
-            .context("failed to download Spring Initializr project archive")?;
+        let response = self.http.execute(request).await.map_err(|error| {
+            network_error(
+                error,
+                &self.base_url,
+                "download Spring Initializr project archive",
+            )
+        })?;
         let status = response.status();
 
         if !status.is_success() {
-            bail!("Spring Initializr generation request failed with HTTP {status}");
+            bail!(
+                "Spring Initializr generation request to {} failed with HTTP {status}. \
+                 Re-check the project options against `spg deps` and current metadata.",
+                self.base_url
+            );
         }
 
         response
@@ -87,6 +103,17 @@ impl InitializrClient {
             .map(|bytes| bytes.to_vec())
             .context("failed to read Spring Initializr project archive")
     }
+}
+
+fn network_error(error: reqwest::Error, base_url: &Url, action: &str) -> anyhow::Error {
+    let hint = if error.is_connect() {
+        format!(": could not connect to {base_url}. Check your network connection.")
+    } else if error.is_timeout() {
+        format!(": connection to {base_url} timed out. Try again later.")
+    } else {
+        format!(" at {base_url}.")
+    };
+    anyhow::Error::new(error).context(format!("failed to {action}{hint}"))
 }
 
 #[cfg(test)]
@@ -162,13 +189,62 @@ mod tests {
             .await
             .expect_err("HTTP error should fail generation download");
 
+        let message = error.to_string();
         assert!(
-            error
-                .to_string()
-                .contains("Spring Initializr generation request failed with HTTP 500")
+            message.contains("HTTP 500"),
+            "error should surface the HTTP status: {message}"
+        );
+        assert!(
+            message.contains("Re-check the project options"),
+            "error should suggest a remediation: {message}"
         );
         assert!(server.request()?.starts_with("GET /starter.zip?"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_reports_http_status_with_actionable_hint() -> anyhow::Result<()> {
+        let server = TestServer::start(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\r\ndown".to_string(),
+        )?;
+        let client = InitializrClient::new(&server.base_url)?;
+
+        let error = client
+            .fetch_metadata()
+            .await
+            .expect_err("HTTP error should fail metadata fetch");
+        let message = error.to_string();
+        assert!(message.contains("HTTP 503"), "got: {message}");
+        assert!(
+            message.contains("Try again later"),
+            "should suggest retrying: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_reports_actionable_message_on_malformed_response() -> anyhow::Result<()>
+    {
+        let server = TestServer::start(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 14\r\n\r\nnot-json-at-all"
+                .to_string(),
+        )?;
+        let client = InitializrClient::new(&server.base_url)?;
+
+        let error = client
+            .fetch_metadata()
+            .await
+            .expect_err("malformed JSON should fail metadata parsing");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("failed to parse Spring Initializr metadata"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("spg cache clear"),
+            "should suggest clearing the cache: {message}"
+        );
         Ok(())
     }
 
