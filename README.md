@@ -13,7 +13,8 @@ for scripted workflows.
 ### Homebrew
 
 ```sh
-brew install anasnaciri/tap/spg
+brew tap anasnaciri/tap
+brew install spg
 ```
 
 ### Cargo
