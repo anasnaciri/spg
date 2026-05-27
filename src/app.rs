@@ -8,7 +8,9 @@ use inquire::Confirm;
 use std::{
     future::Future,
     io::{self, Write},
+    path::PathBuf,
     pin::Pin,
+    time::SystemTime,
 };
 
 pub trait Confirmation {
@@ -22,6 +24,39 @@ pub trait MetadataProvider {
 }
 
 pub struct InquireConfirmation;
+
+pub struct CachedMetadataProvider<'a, P> {
+    cache_file: PathBuf,
+    upstream: &'a mut P,
+    now: SystemTime,
+    ttl: std::time::Duration,
+}
+
+impl<'a, P> CachedMetadataProvider<'a, P> {
+    pub fn new(cache_file: PathBuf, upstream: &'a mut P) -> Self {
+        Self {
+            cache_file,
+            upstream,
+            now: SystemTime::now(),
+            ttl: cache::METADATA_CACHE_TTL,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_settings(
+        cache_file: PathBuf,
+        upstream: &'a mut P,
+        now: SystemTime,
+        ttl: std::time::Duration,
+    ) -> Self {
+        Self {
+            cache_file,
+            upstream,
+            now,
+            ttl,
+        }
+    }
+}
 
 impl Confirmation for InquireConfirmation {
     fn confirm(&mut self, message: &str) -> Result<bool> {
@@ -37,6 +72,27 @@ impl MetadataProvider for InitializrClient {
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<InitializrMetadata>> + 'a>> {
         Box::pin(async move { InitializrClient::fetch_metadata(self).await })
+    }
+}
+
+impl<P> MetadataProvider for CachedMetadataProvider<'_, P>
+where
+    P: MetadataProvider,
+{
+    fn fetch_metadata<'a>(
+        &'a mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<InitializrMetadata>> + 'a>> {
+        Box::pin(async move {
+            if let Some(metadata) =
+                cache::load_fresh_metadata_cache(&self.cache_file, self.now, self.ttl)?
+            {
+                return Ok(metadata);
+            }
+
+            let metadata = self.upstream.fetch_metadata().await?;
+            cache::save_metadata_cache(&self.cache_file, &metadata, self.now)?;
+            Ok(metadata)
+        })
     }
 }
 
@@ -59,6 +115,8 @@ pub async fn run_with_paths(
     confirmation: &mut impl Confirmation,
 ) -> Result<()> {
     let mut metadata_provider = InitializrClient::new_default()?;
+    let mut metadata_provider =
+        CachedMetadataProvider::new(paths.metadata_cache_file.clone(), &mut metadata_provider);
     run_with_services(
         cli,
         paths,
@@ -231,6 +289,21 @@ mod tests {
         }
     }
 
+    struct CountingMetadataProvider {
+        metadata: InitializrMetadata,
+        calls: usize,
+    }
+
+    impl MetadataProvider for CountingMetadataProvider {
+        fn fetch_metadata<'a>(
+            &'a mut self,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<InitializrMetadata>> + 'a>> {
+            self.calls += 1;
+            let metadata = self.metadata.clone();
+            Box::pin(async move { Ok(metadata) })
+        }
+    }
+
     #[tokio::test]
     async fn config_show_prints_saved_toml() -> anyhow::Result<()> {
         let paths = temp_paths("config-show");
@@ -377,6 +450,96 @@ mod tests {
         let output = String::from_utf8(stdout)?;
         assert!(output.contains("web\tSpring Web\tWeb"));
         assert!(output.contains("data-jpa\tSpring Data JPA\tSQL"));
+        assert!(stderr.is_empty());
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deps_uses_fresh_cached_metadata_without_fetching_upstream() -> anyhow::Result<()> {
+        let paths = temp_paths("deps-cache-hit");
+        crate::config::cache::save_metadata_cache(
+            &paths.metadata_cache_file,
+            &sample_metadata()?,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000),
+        )?;
+
+        let cli = Cli::parse_from(["spg", "deps"]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::default();
+        let mut upstream = CountingMetadataProvider {
+            metadata: InitializrMetadata::default(),
+            calls: 0,
+        };
+        let mut cached = CachedMetadataProvider::with_settings(
+            paths.metadata_cache_file.clone(),
+            &mut upstream,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_100),
+            std::time::Duration::from_secs(24 * 60 * 60),
+        );
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut cached,
+        )
+        .await?;
+
+        drop(cached);
+        assert_eq!(upstream.calls, 0);
+        assert!(String::from_utf8(stdout)?.contains("web\tSpring Web\tWeb"));
+        assert!(stderr.is_empty());
+
+        cleanup(&paths);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deps_fetches_and_saves_metadata_when_cache_is_missing() -> anyhow::Result<()> {
+        let paths = temp_paths("deps-cache-miss");
+        let cli = Cli::parse_from(["spg", "deps"]);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut confirmation = StaticConfirmation::default();
+        let mut upstream = CountingMetadataProvider {
+            metadata: sample_metadata()?,
+            calls: 0,
+        };
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let mut cached = CachedMetadataProvider::with_settings(
+            paths.metadata_cache_file.clone(),
+            &mut upstream,
+            now,
+            std::time::Duration::from_secs(24 * 60 * 60),
+        );
+
+        run_with_services(
+            cli,
+            &paths,
+            &mut stdout,
+            &mut stderr,
+            &mut confirmation,
+            &mut cached,
+        )
+        .await?;
+
+        drop(cached);
+        assert_eq!(upstream.calls, 1);
+        assert!(paths.metadata_cache_file.exists());
+        assert!(
+            crate::config::cache::load_fresh_metadata_cache(
+                &paths.metadata_cache_file,
+                now,
+                std::time::Duration::from_secs(24 * 60 * 60)
+            )?
+            .is_some()
+        );
+        assert!(String::from_utf8(stdout)?.contains("web\tSpring Web\tWeb"));
         assert!(stderr.is_empty());
 
         cleanup(&paths);
