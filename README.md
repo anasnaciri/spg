@@ -20,7 +20,7 @@ brew install spg
 ### Cargo
 
 ```sh
-cargo install spg
+cargo install spg-cli
 ```
 
 ## Usage
